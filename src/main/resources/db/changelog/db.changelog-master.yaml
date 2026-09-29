@@ -1,0 +1,15 @@
+databaseChangeLog:
+  # Order matters: 000 must run before 001, since 001's reconciliation table has a FK to
+  # supplier_documents_record, which 000 defensively ensures exists first.
+  - include:
+      file: db/changelog/changes/000-supplier-documents-record-bootstrap.yaml
+  - include:
+      file: db/changelog/changes/001-init-schema.yaml
+  - include:
+      file: db/changelog/changes/002-bank-transaction-import-columns.yaml
+  - include:
+      file: db/changelog/changes/003-bank-statement-and-reconciliation-v2.yaml
+  - include:
+      file: db/changelog/changes/004-reviewed-at-column.yaml
+  - include:
+      file: db/changelog/changes/005-reviewer-full-names.yaml

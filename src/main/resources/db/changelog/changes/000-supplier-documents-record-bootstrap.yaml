@@ -1,0 +1,14 @@
+databaseChangeLog:
+  - changeSet:
+      id: 000-supplier-documents-record-bootstrap
+      author: moac
+      comment: >-
+        Defensive, idempotent bootstrap of account-service's supplier_documents_record table -
+        NOT owned by this service. Protects migration order only: see the .sql file's header
+        comment for the full reasoning. Runs before 001-init-schema (which FKs to this table).
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/000-supplier-documents-record-bootstrap.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

@@ -1,0 +1,24 @@
+# Local development profile - no Keycloak instance required.
+#
+# Run with:
+#   ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+#
+# Fill in your local PostgreSQL details below (host/port/db name, username, password) -
+# left as placeholders on purpose, nothing is assumed about your local setup.
+
+app:
+  security:
+    enabled: false
+  multitenancy:
+    # LOCAL TESTING ONLY. There is no Keycloak/JWT in this profile (security is disabled
+    # above), so TenantFilter has no "accountId" claim to read - it falls back to this plain
+    # request header instead, e.g.:
+    #   curl -H "X-Tenant-Id: 9000000002" http://localhost:7074/reconciliation/...
+    # Only relevant here in application-local.yml: once app.security.enabled=true
+    # (application.yml, every other profile), the JWT claim always wins and this header is
+    # never even read - so it's deliberately not declared there.
+    tenant-header: ${TENANT_HEADER:X-Tenant-Id}
+
+logging:
+  level:
+    be.smobile: DEBUG

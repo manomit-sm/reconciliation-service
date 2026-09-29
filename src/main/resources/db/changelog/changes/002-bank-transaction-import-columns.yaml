@@ -1,0 +1,10 @@
+databaseChangeLog:
+  - changeSet:
+      id: 002-bank-transaction-import-columns
+      author: moac
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/002-bank-transaction-import-columns.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

@@ -1,0 +1,10 @@
+databaseChangeLog:
+  - changeSet:
+      id: 003-bank-statement-and-reconciliation-v2
+      author: moac
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/003-bank-statement-and-reconciliation-v2.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

@@ -1,0 +1,10 @@
+databaseChangeLog:
+  - changeSet:
+      id: 005-reviewer-full-names
+      author: moac
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/005-reviewer-full-names.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

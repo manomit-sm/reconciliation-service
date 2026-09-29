@@ -1,0 +1,10 @@
+databaseChangeLog:
+  - changeSet:
+      id: 004-reviewed-at-column
+      author: moac
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/004-reviewed-at-column.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

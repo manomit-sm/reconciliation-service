@@ -1,0 +1,10 @@
+databaseChangeLog:
+  - changeSet:
+      id: 001-init-schema
+      author: moac
+      changes:
+        - sqlFile:
+            path: db/changelog/sql/001-init-schema.sql
+            relativeToChangelogFile: false
+            splitStatements: false
+            stripComments: false

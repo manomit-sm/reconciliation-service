@@ -1,0 +1,105 @@
+# Default configuration (production-like). See application-local.yml for local development
+# without a Keycloak instance.
+
+server:
+  port: 7074
+  servlet:
+    context-path: /reconciliation
+
+spring:
+  application:
+    name: moac-reconciliation-service
+
+  # PostgreSQL connection. No DataSource/JPA @Bean is declared anywhere in this service -
+  # Spring Boot auto-configures both from these properties alone. Every value here is a
+  # placeholder driven by an env var with no default; fill in the real values via the
+  # environment (or override in application-local.yml for local development).
+  datasource:
+    # mobilaccdb is the real multi-tenant database (see pgAdmin screenshots: tenant_<accountId>
+    # schemas + public live in this one database) - not a separate per-service database.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/mobilaccdb}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:admin123}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    # ddl-auto is "none", not "validate": Hibernate's schema validator connects once via
+    # getAnyConnection() (no tenant in context) and validates against whatever schema that
+    # lands in - under true schema-per-tenant multi-tenancy there is no single schema all
+    # entities live in, so validate fails immediately even when every real tenant schema is
+    # correct (confirmed locally: it failed with "missing table [bank_transaction]" against
+    # the default/public schema despite tenant_test having it). Schema correctness is instead
+    # TenantSchemaMigrationRunner's job, per tenant schema, at startup.
+    hibernate:
+      ddl-auto: none
+    open-in-view: false
+
+  # Multi-tenant (schema-per-account) database - see be.smobile.reconciliation.multitenancy.
+  # Spring Boot's own single-shot Liquibase run only targets one fixed schema, which doesn't
+  # fit "one schema per tenant_<accountId>", so it's disabled here; change-log is still read
+  # directly (see @Value in TenantSchemaMigrationRunner) and applied to every tenant schema at
+  # startup instead of just one.
+  liquibase:
+    enabled: false
+    change-log: classpath:db/changelog/db.changelog-master.yaml
+
+# Toggles the security filter chain - see be.smobile.reconciliation.config.SecurityConfig.
+# true (default): every request must carry a valid bearer JWT, except the paths below.
+# Overridden to false in application-local.yml for local development.
+app:
+  security:
+    enabled: true
+  keycloak:
+    client: ${KC_APP_CLIENT:pilim-app}
+    urls:
+      auth: ${KEYCLOAK_DOMAIN:}
+  # Tenant resolution - see be.smobile.reconciliation.multitenancy.MultiTenancyProperties /
+  # TenantFilter for the full lookup order. The local-only fallback (a plain request header,
+  # for testing without a real Keycloak token) lives in application-local.yml instead of here -
+  # this file only carries the mechanism real traffic actually uses.
+  multitenancy:
+    # Real traffic (Keycloak enabled): read automatically off the already-validated bearer
+    # JWT's "account_id" claim - no header, no code change needed by callers. Confirmed
+    # 2026-09-13 against a real JWT from predev.pilim.net (see MultiTenancyProperties'
+    # javadoc) - snake_case, not the originally-guessed "accountId", and a JSON number, not a
+    # string (handled safely - see that javadoc). If it ever changes again, fix it here only,
+    # nothing else references it.
+    tenant-claim: ${TENANT_CLAIM:account_id}
+    # Not read from a request at all - just the literal prefix the resolved tenant id is
+    # concatenated onto to build the actual Postgres schema name, e.g. accountId
+    # "9000000002" -> schema "tenant_9000000002" (matches the pgAdmin screenshots).
+    schema-prefix: ${TENANT_SCHEMA_PREFIX:tenant_}
+
+# AWS S3 - "Upload Bank Statement" (API 2 of the Frontend API Requirements doc, 2026-09-16)
+# stores the uploaded PDF here. Same keys as moac-doc-gen-service's own aws.* block.
+aws:
+  s3:
+    bucket: ${APPLICATION_FILE_BUCKET:pilim-app-dev}
+  region: ${AWS_REGION:eu-west-1}
+
+# Pilim's AI extraction microservice - see be.smobile.reconciliation.config.AiExtractionProperties
+# for why "url" has no real default yet (that endpoint is still only a proposal to the client).
+ai-extraction:
+  url: ${AI_EXTRACTION_URL:}
+  connect-timeout: ${AI_EXTRACTION_CONNECT_TIMEOUT_MS:5000}
+  read-timeout: ${AI_EXTRACTION_READ_TIMEOUT_MS:30000}
+
+springdoc:
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+---
+# Keycloak / JWT validation - kept out of the "local" profile below so that a local
+# run never needs to reach a Keycloak server. Active for every profile except "local".
+spring:
+  config:
+    activate:
+      on-profile: '!local'
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI:https://api.dev.pilim.eu/keycloak/realms/Pilim}
