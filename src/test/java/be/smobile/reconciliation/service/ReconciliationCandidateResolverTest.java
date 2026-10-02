@@ -64,7 +64,7 @@ class ReconciliationCandidateResolverTest {
     }
 
     @Test
-    void debitTransaction_usesBusinessNameAsPartner() {
+    void debitTransaction_withNoSupplierName_fallsBackToBusinessName() {
         SupplierDocumentsRecord record = SupplierDocumentsRecord.builder()
                 .id(2L)
                 .businessName("Microsoft")
@@ -85,6 +85,60 @@ class ReconciliationCandidateResolverTest {
 
         assertEquals("Microsoft", candidates.getFirst().partnerName());
         assertEquals(0, candidates.getFirst().remainingBalance().compareTo(new BigDecimal("250.0")));
+    }
+
+    /**
+     * Client feedback 2026-09-30 ("partner and reference are always zero"): reproduces the
+     * client's own test-environment data verbatim - businessName is the account's own name
+     * (identical on every one of their records), supplierName is the real counterparty. Before
+     * the fix this returned "McDonald's Restaurants", so PARTNER could never match a bank
+     * description of the actual supplier - confirmed live against the real payload before fixing it.
+     */
+    @Test
+    void debitTransaction_prefersSupplierNameOverTheAccountsOwnBusinessName() {
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder()
+                .id(3L)
+                .businessName("McDonald's Restaurants")
+                .supplierName("NCR Voyix Belgium BV")
+                .firstName("Tamara").lastName("Davis")
+                .dueDate(LocalDate.of(2026, 9, 5))
+                .totalDue(687.64)
+                .build();
+
+        when(supplierDocumentsRecordRepository.findByDueDateGreaterThanEqualOrDueDateIsNull(any())).thenReturn(List.of(record));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        BankTransaction transaction = BankTransaction.builder()
+                .direction(TransactionDirection.DEBIT)
+                .transactionDate(LocalDate.of(2026, 9, 5))
+                .build();
+
+        assertEquals("NCR Voyix Belgium BV", resolver().resolveCandidates(transaction).getFirst().partnerName());
+    }
+
+    /**
+     * Same bug, the customer side: firstName/lastName is the account owner's own name on every
+     * record in the client's data ("Tamara Davis"), never a customer's - it must not be used as
+     * a fallback for a missing clientName.
+     */
+    @Test
+    void creditTransaction_withNoClientName_doesNotFallBackToTheAccountOwnersName() {
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder()
+                .id(4L)
+                .firstName("Tamara").lastName("Davis")
+                .dueDate(LocalDate.of(2026, 9, 5))
+                .totalDue(100.0)
+                .build();
+
+        when(supplierDocumentsRecordRepository.findByDueDateGreaterThanEqualOrDueDateIsNull(any())).thenReturn(List.of(record));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        BankTransaction transaction = BankTransaction.builder()
+                .direction(TransactionDirection.CREDIT)
+                .transactionDate(LocalDate.of(2026, 9, 5))
+                .build();
+
+        assertEquals("", resolver().resolveCandidates(transaction).getFirst().partnerName());
     }
 
     @Test

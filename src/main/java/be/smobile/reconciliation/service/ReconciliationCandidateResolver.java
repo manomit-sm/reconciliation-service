@@ -122,18 +122,37 @@ public class ReconciliationCandidateResolver {
         return treatAsCustomerInvoice ? customerName(record) : supplierName(record);
     }
 
+    /**
+     * Client feedback 2026-09-30 ("partner and reference are always zero"): {@code clientName}
+     * is the only field here that actually identifies a customer. {@code firstName}/{@code
+     * lastName} looked like a plausible fallback, but the client's own test-environment data
+     * (an "expense" record for McDonald's Restaurants, paid to NCR Voyix Belgium BV) shows
+     * {@code firstName: "Tamara", lastName: "Davis"} identically on <i>every</i> row regardless
+     * of who the actual counterparty is - the account owner's own name, not a customer's. Using
+     * it here meant a bank description that matched the real customer exactly still scored
+     * PARTNER = 0 whenever {@code clientName} happened to be blank, and, worse, could produce a
+     * false match against the account owner's own name on an unrelated transaction. No longer
+     * used; a blank {@code clientName} now correctly means "no partner name available" rather
+     * than falling back to something that was never the counterparty.
+     */
     private String customerName(SupplierDocumentsRecord record) {
-        return firstNonBlank(record.getClientName(), joinName(record.getFirstName(), record.getLastName()));
+        return record.getClientName() == null ? "" : record.getClientName().trim();
     }
 
+    /**
+     * Same bug, the supplier side, and the one actually reproduced against the client's data
+     * (2026-09-30): this used to try {@code businessName} <i>before</i> {@code supplierName}.
+     * {@code businessName} is the account's own registered business ("McDonald's Restaurants")
+     * and is populated on every row, supplier or not - so {@code supplierName} (the real
+     * counterparty, e.g. "NCR Voyix Belgium BV") was never even read, and PARTNER matching was
+     * comparing the bank transaction's description against the account holder's own name
+     * instead of the actual supplier's. Confirmed live: a bank transaction described exactly
+     * "NCR VOYIX BELGIUM BV" against that same expense still scored PARTNER = 0 before this fix.
+     * {@code businessName} is kept only as the last resort for the (currently unseen) case where
+     * {@code supplierName} itself is blank.
+     */
     private String supplierName(SupplierDocumentsRecord record) {
-        return firstNonBlank(record.getBusinessName(), record.getSupplierName());
-    }
-
-    private String joinName(String firstName, String lastName) {
-        String first = firstName == null ? "" : firstName.trim();
-        String last = lastName == null ? "" : lastName.trim();
-        return (first + " " + last).trim();
+        return firstNonBlank(record.getSupplierName(), record.getBusinessName());
     }
 
     private String firstNonBlank(String primary, String fallback) {
