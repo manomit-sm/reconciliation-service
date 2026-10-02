@@ -38,6 +38,8 @@ public record MultiPaymentAllocation(
             @Schema(description = "Which payment's label this line belongs to", example = "A") String payment,
             @Schema(description = "Invoice id") @JsonProperty("invoice_id") Long invoiceId,
             @Schema(description = "Human-readable invoice number", example = "INV-2026-031") @JsonProperty("invoice_number") String invoiceNumber,
+            @Schema(description = "The counterparty on the invoice - the supplier for an expense, the customer for a sales invoice", example = "Wholesale Co")
+            @JsonProperty("supplier_name") String supplierName,
             @Schema(description = "Amount of this payment allocated to this invoice") BigDecimal amount) {
     }
 }

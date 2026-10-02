@@ -78,11 +78,46 @@ public class ReconciliationCandidateResolver {
             boolean treatAsCustomerInvoice = treatAsCustomerInvoice(transaction);
             result.put(transaction.getId(), records.stream()
                     .filter(record -> record.getDueDate() == null || !record.getDueDate().isBefore(cutoff))
+                    .filter(record -> directionCompatible(record, transaction))
                     .map(record -> toCandidate(record, alreadyAllocated.getOrDefault(record.getId(), BigDecimal.ZERO), treatAsCustomerInvoice))
                     .filter(candidate -> candidate.remainingBalance().signum() > 0)
                     .toList());
         }
         return result;
+    }
+
+    /** The date the document is dated: {@code invoiceDate}, else the generic {@code date} column - the client's UI shows these as the same "Invoice Date". */
+    private LocalDate invoiceDate(SupplierDocumentsRecord record) {
+        return record.getInvoiceDate() != null ? record.getInvoiceDate() : record.getDate();
+    }
+
+    /**
+     * Identifiers other than the invoice number that a payer might quote: the document's own
+     * {@code reference} (the "Transaction reference" typed on an invoice - client feedback
+     * 2026-10-02, point 5) and its order number. Blanks dropped.
+     */
+    private List<String> extraReferences(SupplierDocumentsRecord record) {
+        return java.util.stream.Stream.of(record.getReference(), record.getOrderNumber())
+                .filter(value -> value != null && !value.isBlank())
+                .map(String::trim)
+                .toList();
+    }
+
+    /**
+     * Money out of the account can only pay an expense/supplier invoice, money in can only be a
+     * customer's payment of a sales invoice - without this, the exact-amount search (which
+     * ignores partner names) could pair a payment with a document of the opposite direction that
+     * happens to have the same amount (bank amounts are stored positive either way). Evidence
+     * for {@code crdr}'s values is the client's own UI: the expense list shows "Debit" for every
+     * row and the invoice list "Credit", and every expense payload they sent has
+     * {@code "crdr":"debit"}. Only a record explicitly flagged as the <i>opposite</i> direction is
+     * excluded - blank or any other value ("debit_note", ...) stays a candidate, as before.
+     */
+    private boolean directionCompatible(SupplierDocumentsRecord record, BankTransaction transaction) {
+        String crdr = record.getCrdr() == null ? "" : record.getCrdr().trim();
+        return transaction.getDirection() == TransactionDirection.CREDIT
+                ? !"debit".equalsIgnoreCase(crdr)
+                : !"credit".equalsIgnoreCase(crdr);
     }
 
     private LocalDate cutoffFor(BankTransaction transaction) {
@@ -101,7 +136,8 @@ public class ReconciliationCandidateResolver {
         // rather than its exact (and misleading) binary form.
         BigDecimal totalDue = record.getTotalDue() == null ? BigDecimal.ZERO : BigDecimal.valueOf(record.getTotalDue());
         BigDecimal remainingBalance = totalDue.subtract(alreadyAllocated);
-        return new MatchCandidate(record.getId(), InvoiceNumbers.of(record), partnerName(record, treatAsCustomerInvoice), record.getDueDate(), remainingBalance);
+        return new MatchCandidate(record.getId(), InvoiceNumbers.of(record), partnerName(record, treatAsCustomerInvoice), record.getDueDate(), remainingBalance,
+                invoiceDate(record), extraReferences(record));
     }
 
     /**

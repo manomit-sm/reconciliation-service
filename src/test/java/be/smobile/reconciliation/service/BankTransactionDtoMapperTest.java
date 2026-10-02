@@ -234,6 +234,37 @@ class BankTransactionDtoMapperTest {
         assertNull(detail.reviewedBy());
     }
 
+    /**
+     * Client feedback 2026-10-02, point 3: a suggested match's matched_invoices had no supplier or
+     * client name, so the UI's "Supplier Name" column showed "-". New expenses have no supplierId but crdr "debit" -
+     * they are supplier documents, so the supplier (not the client) name is looked up.
+     */
+    @Test
+    void toDetail_suggestedMatch_matchedInvoicesCarryTheCounterpartyName() {
+        BankTransaction tx = transaction(BankTransactionStatus.SUGGESTED_MATCH);
+        tx.setDirection(TransactionDirection.DEBIT);
+        MatchCandidate candidate = new MatchCandidate(1L, "EX2026", "NCR Voyix Belgium BV", LocalDate.of(2026, 9, 6), new BigDecimal("250.00"));
+        when(candidateResolver.resolveCandidates(tx)).thenReturn(List.of(candidate));
+        when(candidateResolver.treatAsCustomerInvoice(tx)).thenReturn(false);
+        MatchSuggestion suggestion = new MatchSuggestion(80, List.of(new be.smobile.reconciliation.matching.InvoiceAllocation(1L, new BigDecimal("250.00"))),
+                List.of(new MatchCriterion(MatchCriterionType.AMOUNT, true), new MatchCriterion(MatchCriterionType.PARTNER, true),
+                        new MatchCriterion(MatchCriterionType.REFERENCE, false), new MatchCriterion(MatchCriterionType.DATE, false)));
+        when(matchingEngine.suggest(eq(tx), any())).thenReturn(suggestion);
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(List.of(1L))).thenReturn(List.of());
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder().id(1L).crdr("debit").invoiceNumber("EX2026")
+                .supplierName("NCR Voyix Belgium BV").businessName("McDonald's Restaurants").totalDue(250.0).currency("EUR")
+                .invoiceDate(LocalDate.of(2026, 9, 5)).description("NA").dueDate(LocalDate.of(2026, 9, 6)).build();
+        when(supplierDocumentsRecordRepository.findAllById(List.of(1L))).thenReturn(List.of(record));
+        when(candidateResolver.partnerName(record, false)).thenReturn("NCR Voyix Belgium BV");
+
+        BankTransactionDetail detail = mapper().toDetail(tx);
+
+        assertEquals("NCR Voyix Belgium BV", detail.matchedInvoices().getFirst().supplierName());
+        assertEquals("debit", detail.matchedInvoices().getFirst().type());
+        assertEquals("NA", detail.matchedInvoices().getFirst().description());
+        assertEquals(LocalDate.of(2026, 9, 5), detail.matchedInvoices().getFirst().invoiceDate());
+    }
+
     private BankTransaction transaction(BankTransactionStatus status) {
         Instant now = Instant.now();
         return BankTransaction.builder()

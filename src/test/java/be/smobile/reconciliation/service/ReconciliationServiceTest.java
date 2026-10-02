@@ -70,15 +70,19 @@ class ReconciliationServiceTest {
                 service().classify(new MatchSuggestion(69, List.of(), List.of())));
     }
 
-    /** 2026-09-19 client rule: "When the score is 98% or more... this transaction will not be reconciled manual." */
+    /**
+     * 2026-09-19 client rule ("When the score is 98% or more... this transaction will not be
+     * reconciled manual"), with the threshold lowered to 90 by the client on 2026-10-02.
+     */
     @Test
     void classify_scoreAtOrAboveAutoReconcileThreshold_isReconciled() {
-        assertEquals(BankTransactionStatus.RECONCILED,
-                service().classify(new MatchSuggestion(98, List.of(), List.of())));
+        assertEquals(90, matchingProperties.getAutoReconcileThreshold());
         assertEquals(BankTransactionStatus.RECONCILED,
                 service().classify(new MatchSuggestion(100, List.of(), List.of())));
+        assertEquals(BankTransactionStatus.RECONCILED,
+                service().classify(new MatchSuggestion(90, List.of(), List.of())));
         assertEquals(BankTransactionStatus.SUGGESTED_MATCH,
-                service().classify(new MatchSuggestion(97, List.of(), List.of())));
+                service().classify(new MatchSuggestion(80, List.of(), List.of())));
     }
 
     /** Client feedback 2026-09-28 (point 6): an equal-amount match must reach "Suggested Match" even though 50 < the 70 threshold. */

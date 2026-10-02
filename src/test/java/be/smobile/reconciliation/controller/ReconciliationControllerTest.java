@@ -5,6 +5,7 @@ import be.smobile.reconciliation.imports.BankStatementUploadService;
 import be.smobile.reconciliation.matching.MatchCandidate;
 import be.smobile.reconciliation.model.dto.AlternativeInvoice;
 import be.smobile.reconciliation.model.dto.AlternativeMatchesResponse;
+import be.smobile.reconciliation.model.dto.ReconciliationSummaryResponse;
 import be.smobile.reconciliation.repository.BankTransactionRepository;
 import be.smobile.reconciliation.service.BankTransactionDtoMapper;
 import be.smobile.reconciliation.service.MultiPaymentAllocationService;
@@ -28,6 +29,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.verify;
@@ -128,6 +130,48 @@ class ReconciliationControllerTest {
 
         // Built at all (a non-null Specification instance) - the exact predicate is BankTransactionSpecificationsTest's job.
         assertEquals(false, captor.getValue() == null);
+    }
+
+    // ---- Summary API: startDate/endDate (client feedback 2026-10-02, point 1) ----
+
+    @Test
+    void summary_withStartAndEndDate_summarisesAndReMatchesOverThatRange() {
+        LocalDate start = LocalDate.of(2026, 9, 25);
+        LocalDate end = LocalDate.of(2026, 10, 2);
+        ReconciliationSummaryResponse expected = new ReconciliationSummaryResponse(start, end, new ReconciliationSummaryResponse.Summary(1, 2, 3, 4, 5));
+        when(dashboardService.summary(start, end)).thenReturn(expected);
+
+        assertEquals(expected, controller().summary(start, end, null, null));
+
+        verify(reconciliationService).rematchUnmatched(start, end);
+    }
+
+    @Test
+    void summary_dateRangeWinsOverYearMonthWhenBothAreSent() {
+        LocalDate start = LocalDate.of(2026, 9, 25);
+        LocalDate end = LocalDate.of(2026, 10, 2);
+        ReconciliationSummaryResponse expected = new ReconciliationSummaryResponse(start, end, new ReconciliationSummaryResponse.Summary(0, 0, 0, 0, 0));
+        when(dashboardService.summary(start, end)).thenReturn(expected);
+
+        assertEquals(expected, controller().summary(start, end, 2026, 1));
+    }
+
+    @Test
+    void summary_withYearAndMonthStillWorks() {
+        ReconciliationSummaryResponse expected = new ReconciliationSummaryResponse(2026, 9, new ReconciliationSummaryResponse.Summary(0, 0, 0, 0, 0));
+        when(dashboardService.summary(2026, 9)).thenReturn(expected);
+
+        assertEquals(expected, controller().summary(null, null, 2026, 9));
+
+        verify(reconciliationService).rematchUnmatched(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30));
+    }
+
+    @Test
+    void summary_withNoPeriodAtAll_orAHalfPeriod_orABadMonth_isABadRequest() {
+        assertThrows(IllegalArgumentException.class, () -> controller().summary(null, null, null, null));
+        assertThrows(IllegalArgumentException.class, () -> controller().summary(LocalDate.of(2026, 9, 25), null, null, null));
+        assertThrows(IllegalArgumentException.class, () -> controller().summary(null, null, 2026, null));
+        assertThrows(IllegalArgumentException.class, () -> controller().summary(null, null, 2026, 13));
     }
 
     private Page<BankTransaction> pageOf() {

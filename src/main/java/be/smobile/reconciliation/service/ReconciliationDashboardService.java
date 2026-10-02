@@ -50,17 +50,27 @@ public class ReconciliationDashboardService {
     @Transactional(readOnly = true)
     public ReconciliationSummaryResponse summary(int year, int month) {
         YearMonth ym = YearMonth.of(year, month);
-        LocalDate start = ym.atDay(1);
-        LocalDate end = ym.atEndOfMonth();
+        return new ReconciliationSummaryResponse(year, month, summaryFor(ym.atDay(1), ym.atEndOfMonth()));
+    }
 
+    /**
+     * Same counters over an explicit {@code [startDate, endDate]} range (both inclusive) instead
+     * of one calendar month - client feedback 2026-10-02, point 1: the dashboard now sends
+     * {@code startDate}/{@code endDate} and the year/month-only form couldn't express that.
+     */
+    @Transactional(readOnly = true)
+    public ReconciliationSummaryResponse summary(LocalDate startDate, LocalDate endDate) {
+        return new ReconciliationSummaryResponse(startDate, endDate, summaryFor(startDate, endDate));
+    }
+
+    private ReconciliationSummaryResponse.Summary summaryFor(LocalDate start, LocalDate end) {
         long unmatched = bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.UNMATCHED);
         long suggested = bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.SUGGESTED_MATCH);
         long needsReview = bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.NEEDS_REVIEW);
 
         OverdueCounts overdue = overdueCounts();
 
-        return new ReconciliationSummaryResponse(year, month,
-                new ReconciliationSummaryResponse.Summary(unmatched, suggested, needsReview, overdue.customers(), overdue.suppliers()));
+        return new ReconciliationSummaryResponse.Summary(unmatched, suggested, needsReview, overdue.customers(), overdue.suppliers());
     }
 
     private record OverdueCounts(long customers, long suppliers) {

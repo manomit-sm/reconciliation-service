@@ -181,6 +181,161 @@ class RuleBasedMatchingEngineTest {
         assertEquals(80, suggestion.confidenceScore());
     }
 
+    // ---- Client feedback 2026-10-02 ("Bugs and API Update Required"), figures taken from its screenshots ----
+
+    /**
+     * Point 2: a -13,266.99 payment to "B SNCB" (29 Jan). The only B SNCB invoice left open is a
+     * 16,866.57 one dated 26 Sep (eight months AFTER the payment); LA VIGNETTE has an expense of
+     * exactly 13,266.99 dated 29 Jan. The engine used to suggest the B SNCB one - a partial
+     * payment of it scored "Amount +50, Partner +30" - instead of the same-amount, same-date expense.
+     */
+    @Test
+    void point2_sameAmountSameDateExpenseBeatsAPartialPaymentOfAFutureDatedInvoice() {
+        BankTransaction payment = transaction("B SNCB", "", "13266.99", LocalDate.of(2026, 1, 29));
+        MatchCandidate futureBsncb = candidate(5L, "EX2026092910271783", "B SNCB", LocalDate.of(2026, 9, 26), "16866.57", LocalDate.of(2026, 9, 26));
+        MatchCandidate vignette = candidate(4L, "EX2026013000000001", "LA VIGNETTE", LocalDate.of(2026, 1, 29), "13266.99", LocalDate.of(2026, 1, 29));
+
+        MatchSuggestion suggestion = engine.suggest(payment, List.of(futureBsncb, vignette));
+
+        assertEquals(1, suggestion.allocations().size());
+        assertEquals(4L, suggestion.allocations().getFirst().invoiceId());
+        assertEquals(0, suggestion.allocations().getFirst().amount().compareTo(new BigDecimal("13266.99")));
+        assertTrue(criterion(suggestion, MatchCriterionType.AMOUNT));
+        assertTrue(criterion(suggestion, MatchCriterionType.DATE));
+        assertEquals(60, suggestion.confidenceScore());
+    }
+
+    /** The N:1 installment case (design doc 5.3) must survive point 2's fix: a past-dated bigger invoice of the same partner is still suggested over an unrelated exact-amount one. */
+    @Test
+    void point2_partialPaymentOfThePartnersOwnEarlierInvoiceIsStillSuggested() {
+        BankTransaction payment = transaction("Customer ABC", "", "400.00", LocalDate.of(2026, 9, 10));
+        MatchCandidate partnersBigInvoice = candidate(1L, "INV-1", "Customer ABC", LocalDate.of(2026, 9, 10), "1000.00", LocalDate.of(2026, 8, 1));
+        MatchCandidate unrelatedExact = candidate(2L, "INV-2", "Someone Else", LocalDate.of(2026, 9, 10), "400.00", LocalDate.of(2026, 8, 1));
+
+        MatchSuggestion suggestion = engine.suggest(payment, List.of(partnersBigInvoice, unrelatedExact));
+
+        assertEquals(1L, suggestion.allocations().getFirst().invoiceId());
+        assertEquals(0, suggestion.allocations().getFirst().amount().compareTo(new BigDecimal("400.0000")));
+    }
+
+    /**
+     * Point 4: +9,721.00 "January Transaction #28" (28 Jan); two invoices of 4,860.50 for
+     * DIFFERENT customers (neither named like the transaction), both dated 28 Jan - combined they
+     * match it exactly, yet it stayed "Unmatched" because the engine only combined invoices of
+     * the transaction's own partner.
+     */
+    @Test
+    void point4_twoInvoicesOfDifferentCustomersThatSumToTheTransactionAreSuggested() {
+        BankTransaction payment = transaction("January Transaction #28", "", "9721.00", LocalDate.of(2026, 1, 28));
+        List<MatchCandidate> invoices = List.of(
+                candidate(26L, "INV00026", "January Transaction #59", LocalDate.of(2026, 10, 2), "4860.50", LocalDate.of(2026, 1, 28)),
+                candidate(25L, "INV00025", "BP Garage", LocalDate.of(2026, 10, 2), "4860.50", LocalDate.of(2026, 1, 28)),
+                candidate(24L, "INV00024", "January Transaction #59", LocalDate.of(2026, 10, 2), "13535.23", LocalDate.of(2026, 1, 28)),
+                candidate(23L, "INV00023", "Shell Garage", LocalDate.of(2026, 11, 1), "6767.62", LocalDate.of(2026, 1, 28)),
+                candidate(22L, "INV00022", "Shell Garage", LocalDate.of(2026, 11, 1), "6767.62", LocalDate.of(2026, 1, 28)));
+
+        MatchSuggestion suggestion = engine.suggest(payment, invoices);
+
+        assertEquals(List.of(25L, 26L), suggestion.allocations().stream().map(InvoiceAllocation::invoiceId).sorted().toList());
+        BigDecimal total = suggestion.allocations().stream().map(InvoiceAllocation::amount).reduce(BigDecimal.ZERO, BigDecimal::add);
+        assertEquals(0, total.compareTo(new BigDecimal("9721.00")));
+        assertTrue(criterion(suggestion, MatchCriterionType.AMOUNT));
+        assertFalse(criterion(suggestion, MatchCriterionType.PARTNER));
+        assertTrue(criterion(suggestion, MatchCriterionType.DATE));
+        assertEquals(60, suggestion.confidenceScore());
+    }
+
+    /** One invoice that matches exactly is preferred over combining several. */
+    @Test
+    void point4_aSingleExactInvoiceIsPreferredOverACombination() {
+        BankTransaction payment = transaction("Anyone", "", "300.00", LocalDate.of(2026, 9, 5));
+        List<MatchCandidate> invoices = List.of(
+                candidate(1L, "A", "X", LocalDate.of(2026, 9, 5), "100.00", LocalDate.of(2026, 9, 5)),
+                candidate(2L, "B", "Y", LocalDate.of(2026, 9, 5), "200.00", LocalDate.of(2026, 9, 5)),
+                candidate(3L, "C", "Z", LocalDate.of(2026, 9, 5), "300.00", LocalDate.of(2026, 9, 5)));
+
+        assertEquals(List.of(3L), engine.suggest(payment, invoices).allocations().stream().map(InvoiceAllocation::invoiceId).toList());
+    }
+
+    /**
+     * Point 5 (date): an expense with exactly the transaction's date (25 Jan) but due months
+     * later (2 Oct) showed "Date Match 0" - only the due date was compared.
+     */
+    @Test
+    void point5_dateMatchesWhenTheInvoiceDateEqualsTheTransactionDateEvenIfDueMuchLater() {
+        BankTransaction payment = transaction("January Transaction #56", "", "7477.83", LocalDate.of(2026, 1, 25));
+        MatchCandidate expense = candidate(1L, "EX2026100212025947", "Telkom SA SOC Ltd.", LocalDate.of(2026, 10, 2), "7477.83", LocalDate.of(2026, 1, 25));
+
+        MatchSuggestion suggestion = engine.suggest(payment, List.of(expense));
+
+        assertTrue(criterion(suggestion, MatchCriterionType.DATE));
+        assertEquals(60, suggestion.confidenceScore());
+    }
+
+    @Test
+    void point5_dateStillMatchesOnTheDueDateAloneWhenThereIsNoInvoiceDate() {
+        BankTransaction payment = transaction("Customer ABC", "", "250.00", LocalDate.of(2026, 9, 5));
+        MatchCandidate invoice = candidate(1L, "INV-1", "Customer ABC", LocalDate.of(2026, 9, 7), "250.00");
+
+        assertTrue(criterion(engine.suggest(payment, List.of(invoice)), MatchCriterionType.DATE));
+    }
+
+    /**
+     * Point 5 (reference): invoice INV00027 "January Transaction #27" was created with the
+     * transaction reference "JAN-2026-0027", which is also the bank transaction's reference - but
+     * only the invoice number (INV00027) was ever searched for, so REFERENCE stayed 0.
+     */
+    @Test
+    void point5_referenceMatchesTheDocumentsOwnReferenceNotOnlyItsInvoiceNumber() {
+        BankTransaction payment = transaction("January Transaction #27", "JAN-2026-0027", "8046.00", LocalDate.of(2026, 1, 27));
+        MatchCandidate invoice = new MatchCandidate(1L, "INV00027", "January Transaction #27", LocalDate.of(2026, 10, 2),
+                new BigDecimal("8046.00"), LocalDate.of(2026, 1, 27), List.of("JAN-2026-0027"));
+
+        MatchSuggestion suggestion = engine.suggest(payment, List.of(invoice));
+
+        assertTrue(criterion(suggestion, MatchCriterionType.REFERENCE));
+        assertEquals(100, suggestion.confidenceScore());
+    }
+
+    @Test
+    void point5_aShortOrderNumberLike001IsNotTreatedAsAReference() {
+        BankTransaction payment = transaction("January Transaction #27", "JAN-2026-0010 ref 001", "8046.00", LocalDate.of(2026, 1, 27));
+        MatchCandidate invoice = new MatchCandidate(1L, "INV00027", "January Transaction #27", LocalDate.of(2026, 10, 2),
+                new BigDecimal("8046.00"), LocalDate.of(2026, 1, 27), List.of("001"));
+
+        assertFalse(criterion(engine.suggest(payment, List.of(invoice)), MatchCriterionType.REFERENCE));
+    }
+
+    /**
+     * Point 6: +571.97 on 26 Jan; two invoices of 571.97 - INV00029 dated 28 Jan (two days AFTER
+     * the payment) and INV00028 dated 24 Jan (two days before). The one dated after was suggested.
+     */
+    @Test
+    void point6_ofTwoSameAmountInvoicesThePastDatedOneIsSuggested() {
+        BankTransaction payment = transaction("January Transaction #57", "", "571.97", LocalDate.of(2026, 1, 26));
+        MatchCandidate future = candidate(29L, "INV00029", "BP Garage", LocalDate.of(2026, 10, 2), "571.97", LocalDate.of(2026, 1, 28));
+        MatchCandidate past = candidate(28L, "INV00028", "Shell Garage", LocalDate.of(2026, 11, 1), "571.97", LocalDate.of(2026, 1, 24));
+
+        assertEquals(28L, engine.suggest(payment, List.of(future, past)).allocations().getFirst().invoiceId());
+        assertEquals(28L, engine.suggest(payment, List.of(past, future)).allocations().getFirst().invoiceId());
+    }
+
+    @Test
+    void point6_aFutureDatedInvoiceIsStillSuggestedWhenItIsTheOnlyMatch() {
+        BankTransaction payment = transaction("January Transaction #57", "", "571.97", LocalDate.of(2026, 1, 26));
+        MatchCandidate future = candidate(29L, "INV00029", "BP Garage", LocalDate.of(2026, 10, 2), "571.97", LocalDate.of(2026, 1, 28));
+
+        assertEquals(29L, engine.suggest(payment, List.of(future)).allocations().getFirst().invoiceId());
+    }
+
+    private boolean criterion(MatchSuggestion suggestion, MatchCriterionType type) {
+        return suggestion.criteria().stream().filter(c -> c.type() == type).findFirst().orElseThrow().met();
+    }
+
+    private MatchCandidate candidate(Long id, String invoiceNumber, String partnerName, LocalDate dueDate, String remainingBalance, LocalDate invoiceDate) {
+        return new MatchCandidate(id, invoiceNumber, partnerName, dueDate, new BigDecimal(remainingBalance), invoiceDate, List.of());
+    }
+
     private BankTransaction transaction(String description, String reference, String amount, LocalDate date) {
         return BankTransaction.builder()
                 .description(description)

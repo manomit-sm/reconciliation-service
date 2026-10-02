@@ -88,15 +88,34 @@ public class ReconciliationController {
     private final BankTransactionDtoMapper dtoMapper;
     private final MultiPaymentAllocationService multiPaymentAllocationService;
 
-    @Operation(summary = "Get reconciliation summary", description = "API 1. Dashboard counters for a given month: unmatched/suggested-match/needs-review "
-            + "transaction counts plus overdue customer and supplier invoice counts.")
-    @ApiResponse(responseCode = "200", description = "Summary computed successfully.")
+    @Operation(summary = "Get reconciliation summary", description = "API 1. Dashboard counters for a period: unmatched/suggested-match/needs-review "
+            + "transaction counts plus overdue customer and supplier invoice counts. Select the period with startDate+endDate (an explicit "
+            + "range, both inclusive) or with year+month (one calendar month); if both forms are sent, startDate+endDate win.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Summary computed successfully."),
+            @ApiResponse(responseCode = "400", description = "Neither startDate+endDate nor year+month was supplied, or the month is not 1-12.",
+                    content = @Content(mediaType = "application/problem+json", schema = @Schema(implementation = ProblemDetail.class)))
+    })
     @GetMapping("/summary")
     public ReconciliationSummaryResponse summary(
-            @Parameter(description = "Calendar year, e.g. 2026", required = true, example = "2026") @RequestParam int year,
-            @Parameter(description = "Calendar month (1-12)", required = true, example = "9") @RequestParam int month) {
-        refreshMatches(year, month);
-        return dashboardService.summary(year, month);
+            @Parameter(description = "Start of an explicit date range (inclusive, ISO yyyy-MM-dd). Requires endDate; together they take priority over year/month.", example = "2026-09-25")
+            @RequestParam(required = false) LocalDate startDate,
+            @Parameter(description = "End of an explicit date range (inclusive, ISO yyyy-MM-dd). Requires startDate.", example = "2026-10-02")
+            @RequestParam(required = false) LocalDate endDate,
+            @Parameter(description = "Calendar year, e.g. 2026 - used with month when startDate/endDate are not both given", example = "2026") @RequestParam(required = false) Integer year,
+            @Parameter(description = "Calendar month (1-12) - used with year when startDate/endDate are not both given", example = "9") @RequestParam(required = false) Integer month) {
+        if (startDate != null && endDate != null) {
+            refreshMatches(null, null, startDate, endDate);
+            return dashboardService.summary(startDate, endDate);
+        }
+        if (year != null && month != null) {
+            if (month < 1 || month > 12) {
+                throw new IllegalArgumentException("month must be between 1 and 12, was " + month);
+            }
+            refreshMatches(year, month);
+            return dashboardService.summary(year, month);
+        }
+        throw new IllegalArgumentException("Provide startDate and endDate, or year and month");
     }
 
     @Operation(summary = "Upload bank statement", description = "API 2. Uploads a bank statement PDF: computes its MD5 for duplicate detection, "

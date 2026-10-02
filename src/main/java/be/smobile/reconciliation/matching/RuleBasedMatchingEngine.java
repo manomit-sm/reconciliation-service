@@ -46,6 +46,20 @@ import java.util.Optional;
  * falls out of {@link MatchCandidate#remainingBalance()} already reflecting prior partial
  * allocations (the caller's job to compute) - the second payment is just matched against
  * whatever balance is left, the same as any other candidate.
+ * <p>
+ * <b>Several candidate suggestions, one winner (client feedback 2026-10-02, points 2/4/6)</b>:
+ * the partner-restricted search above is only <i>one</i> option. Bank descriptions are free text
+ * and often don't resemble an invoice's registered name, so (unless
+ * {@code suggest-on-exact-amount} is off) a second option is also built from <i>all</i>
+ * candidates: the fewest invoices - of any partner - whose open balances add up to exactly the
+ * transaction amount (a single invoice, or several: two €4,860.50 invoices for different
+ * customers paying a €9,721.00 transaction). Each option is scored with the same four criteria
+ * and the best one wins, in this order: a suggestion that is actually showable (clears the
+ * suggested threshold, or matches the amount exactly) beats one that isn't; then one that uses
+ * no <i>future-dated</i> invoice (dated after the payment - far more likely a later invoice than
+ * what was paid) beats one that does, so a partial payment of a bigger invoice dated months
+ * later can no longer outrank a same-amount, same-date expense; then the higher score; then
+ * (ties) amount-matched, partner-matched, fewer invoices, closer in date.
  */
 @Component
 @RequiredArgsConstructor
@@ -53,82 +67,125 @@ public class RuleBasedMatchingEngine implements MatchingEngine {
 
     private final MatchingProperties properties;
 
+    /** Shortest {@code reference}/order-number worth searching for in a bank text - below this a plain number like "001" matches by pure coincidence. */
+    private static final int MIN_EXTRA_REFERENCE_LENGTH = 4;
+
     @Override
     public MatchSuggestion suggest(BankTransaction transaction, List<MatchCandidate> candidates) {
         BigDecimal targetAmount = transaction.getAmount().abs();
+        LocalDate transactionDate = transaction.getTransactionDate();
         String transactionText = normalize(transaction.getDescription()) + " " + normalize(transaction.getReference());
         String transactionPartner = normalize(transaction.getDescription());
+        Comparator<MatchCandidate> preferred = preference(transactionDate);
+
+        List<Option> options = new ArrayList<>();
 
         List<MatchCandidate> partnerMatches = candidates.stream()
                 .filter(c -> partnerMatches(c, transactionPartner))
-                .sorted(Comparator.comparing(c -> dateDistanceDays(transaction.getTransactionDate(), c.dueDate())))
+                .sorted(preferred)
                 .limit(properties.getMaxCandidatesForGrouping())
                 .toList();
-
-        GroupMatch group = partnerMatches.isEmpty() ? GroupMatch.empty() : findBestGroup(partnerMatches, targetAmount);
-
-        if (!group.exact() && properties.isSuggestOnExactAmount()) {
-            Optional<MatchCandidate> amountOnly = exactAmountCandidate(candidates, transaction, targetAmount);
-            if (amountOnly.isPresent()) {
-                return amountOnlySuggestion(transaction, transactionText, amountOnly.get(), targetAmount);
+        if (!partnerMatches.isEmpty()) {
+            GroupMatch group = findBestGroup(partnerMatches, targetAmount);
+            if (!group.isEmpty()) {
+                options.add(option(group, transaction, transactionText, transactionPartner));
             }
         }
-        if (group.isEmpty()) {
-            return MatchSuggestion.none();
+
+        if (properties.isSuggestOnExactAmount()) {
+            List<MatchCandidate> pool = candidates.stream()
+                    .filter(c -> c.remainingBalance() != null && c.remainingBalance().signum() > 0)
+                    .sorted(preferred)
+                    .limit(properties.getMaxCandidatesForGrouping())
+                    .toList();
+            GroupMatch group = findExactGroup(pool, targetAmount);
+            if (!group.isEmpty()) {
+                options.add(option(group, transaction, transactionText, transactionPartner));
+            }
         }
 
+        return options.stream()
+                .min(optionOrder())
+                .map(Option::suggestion)
+                .orElseGet(MatchSuggestion::none);
+    }
+
+    /** One scored candidate suggestion - see the class javadoc for how {@link #optionOrder} ranks them. */
+    private record Option(MatchSuggestion suggestion, boolean showable, boolean amountMet, boolean partnerMet,
+                          boolean futureDated, int invoiceCount, long dateDistance, long firstInvoiceId) {
+    }
+
+    private Option option(GroupMatch group, BankTransaction transaction, String transactionText, String transactionPartner) {
+        LocalDate transactionDate = transaction.getTransactionDate();
+        boolean partnerMet = group.candidates().stream().allMatch(c -> partnerMatches(c, transactionPartner));
         boolean referenceMet = group.candidates().stream().anyMatch(c -> referenceMatches(c, transactionText));
         boolean dateMet = group.candidates().stream()
-                .anyMatch(c -> dateDistanceDays(transaction.getTransactionDate(), c.dueDate()) <= properties.getDateToleranceDays());
+                .anyMatch(c -> dateDistanceDays(transactionDate, c) <= properties.getDateToleranceDays());
 
         List<MatchCriterion> criteria = List.of(
                 new MatchCriterion(MatchCriterionType.AMOUNT, group.exact()),
-                new MatchCriterion(MatchCriterionType.PARTNER, true),
+                new MatchCriterion(MatchCriterionType.PARTNER, partnerMet),
                 new MatchCriterion(MatchCriterionType.REFERENCE, referenceMet),
                 new MatchCriterion(MatchCriterionType.DATE, dateMet));
 
         int score = (group.exact() ? properties.getAmountWeight() : 0)
-                + properties.getPartnerWeight()
+                + (partnerMet ? properties.getPartnerWeight() : 0)
                 + (referenceMet ? properties.getReferenceWeight() : 0)
                 + (dateMet ? properties.getDateWeight() : 0);
 
-        return new MatchSuggestion(score, group.allocations(), criteria);
+        boolean showable = score >= properties.getSuggestedThreshold() || (properties.isSuggestOnExactAmount() && group.exact());
+        long distance = group.candidates().stream().mapToLong(c -> dateDistanceDays(transactionDate, c)).min().orElse(Long.MAX_VALUE);
+        return new Option(
+                new MatchSuggestion(score, group.allocations(), criteria),
+                showable, group.exact(), partnerMet,
+                group.candidates().stream().anyMatch(c -> isFutureDated(c, transactionDate)),
+                group.allocations().size(), distance,
+                group.allocations().getFirst().invoiceId());
+    }
+
+    /** Best option first - see the class javadoc. */
+    private Comparator<Option> optionOrder() {
+        return Comparator.<Option, Boolean>comparing(o -> !o.showable())
+                .thenComparing(Option::futureDated)
+                .thenComparing(o -> -o.suggestion().confidenceScore())
+                .thenComparing(o -> !o.amountMet())
+                .thenComparing(o -> !o.partnerMet())
+                .thenComparingInt(Option::invoiceCount)
+                .thenComparingLong(Option::dateDistance)
+                .thenComparingLong(Option::firstInvoiceId);
     }
 
     /**
-     * Client feedback 2026-09-28 (point 6): an invoice/expense whose open balance equals the
-     * transaction amount to the cent is worth showing even when nothing identifies its partner
-     * (bank descriptions are free text and often look nothing like the supplier's registered
-     * name). Deliberately a <i>single</i> invoice only, never a subset-sum across unrelated
-     * partners - lumping arbitrary invoices together on amount alone would suggest nonsense.
-     * The closest due date wins when several invoices share the same amount.
+     * Best candidate first: not future-dated before future-dated, then the closest in date
+     * (client feedback 2026-10-02, point 6: of two same-amount invoices, the one dated before the
+     * payment is the likelier one, not the one dated after it), then lowest id for a stable order.
      */
-    private Optional<MatchCandidate> exactAmountCandidate(List<MatchCandidate> candidates, BankTransaction transaction, BigDecimal targetAmount) {
-        long target = toMicros(targetAmount);
-        if (target <= 0) {
-            return Optional.empty();
-        }
-        return candidates.stream()
-                .filter(c -> c.remainingBalance() != null && c.remainingBalance().signum() > 0 && toMicros(c.remainingBalance()) == target)
-                .min(Comparator.comparing(c -> dateDistanceDays(transaction.getTransactionDate(), c.dueDate())));
+    private Comparator<MatchCandidate> preference(LocalDate transactionDate) {
+        return Comparator.<MatchCandidate, Boolean>comparing(c -> isFutureDated(c, transactionDate))
+                .thenComparingLong(c -> dateDistanceDays(transactionDate, c))
+                .thenComparing(MatchCandidate::invoiceId);
     }
 
-    /** Same scoring as {@link #suggest}'s normal path, minus the partner criterion (which by definition didn't match here). */
-    private MatchSuggestion amountOnlySuggestion(BankTransaction transaction, String transactionText, MatchCandidate candidate, BigDecimal targetAmount) {
-        boolean referenceMet = referenceMatches(candidate, transactionText);
-        boolean dateMet = dateDistanceDays(transaction.getTransactionDate(), candidate.dueDate()) <= properties.getDateToleranceDays();
+    private boolean isFutureDated(MatchCandidate candidate, LocalDate transactionDate) {
+        return candidate.invoiceDate() != null && transactionDate != null && candidate.invoiceDate().isAfter(transactionDate);
+    }
 
-        List<MatchCriterion> criteria = List.of(
-                new MatchCriterion(MatchCriterionType.AMOUNT, true),
-                new MatchCriterion(MatchCriterionType.PARTNER, false),
-                new MatchCriterion(MatchCriterionType.REFERENCE, referenceMet),
-                new MatchCriterion(MatchCriterionType.DATE, dateMet));
-
-        int score = properties.getAmountWeight()
-                + (referenceMet ? properties.getReferenceWeight() : 0)
-                + (dateMet ? properties.getDateWeight() : 0);
-
-        return new MatchSuggestion(score, List.of(new InvoiceAllocation(candidate.invoiceId(), targetAmount)), criteria);
+    /**
+     * The fewest invoices - of any partner - whose full open balances add up to exactly
+     * {@code targetAmount}; empty if there's no such set. Client feedback 2026-10-02, points 2 and
+     * 4. {@code candidates} must already be in {@link #preference} order so that, among equally
+     * small sets, the preferred invoices are the ones found first.
+     */
+    private GroupMatch findExactGroup(List<MatchCandidate> candidates, BigDecimal targetAmount) {
+        long target = toMicros(targetAmount);
+        if (target <= 0) {
+            return GroupMatch.empty();
+        }
+        List<Integer> indices = reachableSums(candidates, target).get(target);
+        if (indices == null || indices.isEmpty()) {
+            return GroupMatch.empty();
+        }
+        return GroupMatch.fullyExact(indices.stream().map(candidates::get).toList());
     }
 
     private boolean partnerMatches(MatchCandidate candidate, String transactionPartner) {
@@ -141,16 +198,40 @@ public class RuleBasedMatchingEngine implements MatchingEngine {
                 || candidatePartner.contains(transactionPartner);
     }
 
+    /**
+     * Client feedback 2026-10-02 (point 5, "does not detect reference match"): an invoice created
+     * with the transaction reference "JAN-2026-0027" never scored REFERENCE because only its
+     * <i>invoice number</i> ("INV00027", auto-generated) was searched for in the bank text. The
+     * document's own {@code reference} and order number are searched too - any of them appearing
+     * in the transaction's description or reference counts.
+     */
     private boolean referenceMatches(MatchCandidate candidate, String transactionText) {
         String invoiceNumber = normalize(candidate.invoiceNumber());
-        return !invoiceNumber.isEmpty() && transactionText.contains(invoiceNumber);
+        if (!invoiceNumber.isEmpty() && transactionText.contains(invoiceNumber)) {
+            return true;
+        }
+        return candidate.references().stream()
+                .map(this::normalize)
+                .anyMatch(ref -> ref.length() >= MIN_EXTRA_REFERENCE_LENGTH && transactionText.contains(ref));
     }
 
-    private long dateDistanceDays(LocalDate transactionDate, LocalDate dueDate) {
-        if (transactionDate == null || dueDate == null) {
+    /**
+     * Days between the transaction and the closer of the invoice's <i>invoice date</i> and
+     * <i>due date</i> (client feedback 2026-10-02, point 5: comparing the due date alone scored
+     * "Date Match 0" for an expense with exactly the transaction's date, just because it was due
+     * months later). {@link Long#MAX_VALUE} if neither is known.
+     */
+    private long dateDistanceDays(LocalDate transactionDate, MatchCandidate candidate) {
+        if (transactionDate == null) {
             return Long.MAX_VALUE;
         }
-        return Math.abs(ChronoUnit.DAYS.between(transactionDate, dueDate));
+        long best = Long.MAX_VALUE;
+        for (LocalDate date : new LocalDate[]{candidate.invoiceDate(), candidate.dueDate()}) {
+            if (date != null) {
+                best = Math.min(best, Math.abs(ChronoUnit.DAYS.between(transactionDate, date)));
+            }
+        }
+        return best;
     }
 
     private String normalize(String value) {
@@ -207,31 +288,7 @@ public class RuleBasedMatchingEngine implements MatchingEngine {
             return GroupMatch.empty();
         }
 
-        Map<Long, List<Integer>> reachable = new LinkedHashMap<>();
-        reachable.put(0L, List.of());
-
-        for (int i = 0; i < candidates.size(); i++) {
-            BigDecimal balance = candidates.get(i).remainingBalance();
-            if (balance == null || balance.signum() <= 0) {
-                continue;
-            }
-            long amount = toMicros(balance);
-            if (amount > target) {
-                continue;
-            }
-
-            Map<Long, List<Integer>> additions = new LinkedHashMap<>();
-            for (Map.Entry<Long, List<Integer>> entry : reachable.entrySet()) {
-                long newSum = entry.getKey() + amount;
-                if (newSum > target || reachable.containsKey(newSum) || additions.containsKey(newSum)) {
-                    continue;
-                }
-                List<Integer> newIndices = new ArrayList<>(entry.getValue());
-                newIndices.add(i);
-                additions.put(newSum, newIndices);
-            }
-            reachable.putAll(additions);
-        }
+        Map<Long, List<Integer>> reachable = reachableSums(candidates, target);
 
         // Tier 1: exact full-consumption subset.
         List<Integer> exactIndices = reachable.get(target);
@@ -264,6 +321,46 @@ public class RuleBasedMatchingEngine implements MatchingEngine {
         return closestSingleCandidate(candidates, targetAmount)
                 .map(c -> GroupMatch.singleFallback(c, c.remainingBalance().min(targetAmount)))
                 .orElseGet(GroupMatch::empty);
+    }
+
+
+    /**
+     * Every sum {@code <= target} reachable by fully consuming some subset of {@code candidates},
+     * mapped to the indices making it up - the <i>smallest</i> such subset (earliest indices on a
+     * tie, i.e. the most preferred candidates), so an exact hit never uses more invoices than it
+     * needs to.
+     */
+    private Map<Long, List<Integer>> reachableSums(List<MatchCandidate> candidates, long target) {
+        Map<Long, List<Integer>> reachable = new LinkedHashMap<>();
+        reachable.put(0L, List.of());
+
+        for (int i = 0; i < candidates.size(); i++) {
+            BigDecimal balance = candidates.get(i).remainingBalance();
+            if (balance == null || balance.signum() <= 0) {
+                continue;
+            }
+            long amount = toMicros(balance);
+            if (amount > target) {
+                continue;
+            }
+
+            Map<Long, List<Integer>> additions = new LinkedHashMap<>();
+            for (Map.Entry<Long, List<Integer>> entry : reachable.entrySet()) {
+                long newSum = entry.getKey() + amount;
+                if (newSum > target) {
+                    continue;
+                }
+                List<Integer> current = additions.containsKey(newSum) ? additions.get(newSum) : reachable.get(newSum);
+                if (current != null && current.size() <= entry.getValue().size() + 1) {
+                    continue;
+                }
+                List<Integer> newIndices = new ArrayList<>(entry.getValue());
+                newIndices.add(i);
+                additions.put(newSum, newIndices);
+            }
+            reachable.putAll(additions);
+        }
+        return reachable;
     }
 
     private long toMicros(BigDecimal amount) {

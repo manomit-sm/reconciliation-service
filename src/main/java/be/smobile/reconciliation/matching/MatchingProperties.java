@@ -54,13 +54,16 @@ public class MatchingProperties {
      * or more, set the status as Paid and this transaction will not be reconciled manual."
      * ("Paid" is read as this module's own {@code reconciled} status - the doc has no separate
      * transaction-level "Paid" state, only an invoice-level one; see
-     * {@link be.smobile.reconciliation.model.enums.BankTransactionStatus}.) Given the four
-     * criteria weights (50/30/10/10) only ever sum to 30/40/50/60/70/80/90/100, 98 in practice
-     * means "every criterion matched" (100) - deliberately left as 98, not hardcoded to 100, so
-     * the client can loosen it later without a code change. See
+     * {@link be.smobile.reconciliation.model.enums.BankTransactionStatus}.)
+     * <p>
+     * <b>Lowered from 98 to 90 by the client, 2026-10-02</b> ("I changed the autoreconcilation
+     * threshold from 98 to 90% which make more sens"). The four criteria weights (50/30/10/10)
+     * only ever sum to 30/40/50/60/70/80/90/100, so 90 means "amount and partner both matched,
+     * plus at least one of reference/date" - no longer "every criterion matched". A match
+     * without the partner criterion can never reach it (50 + 10 + 10 = 70 at most). See
      * {@link be.smobile.reconciliation.service.ReconciliationService#classify}.
      */
-    private int autoReconcileThreshold = 98;
+    private int autoReconcileThreshold = 90;
 
     /**
      * Confidence >= this is section 7's "Auto Suggest" band, vs. "Review Required" below it.
@@ -71,7 +74,12 @@ public class MatchingProperties {
      */
     private int autoSuggestThreshold = 90;
 
-    /** How many days apart a transaction and an invoice's due date may be for the DATE criterion to still count as met. */
+    /**
+     * How many days apart a transaction and an invoice's <i>invoice date or due date</i> (whichever
+     * is closer - client feedback 2026-10-02, point 5: an expense with the same invoice date as the
+     * transaction scored "Date Match 0" because only the due date was compared) may be for the
+     * DATE criterion to still count as met.
+     */
     private int dateToleranceDays = 7;
 
     /** Max candidate invoices considered per grouping search (section 10's own guidance: "10-50 candidate invoices... not 50,000"), to keep the subset-sum search bounded. */

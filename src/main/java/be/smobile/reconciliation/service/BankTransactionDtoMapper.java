@@ -16,6 +16,7 @@ import be.smobile.reconciliation.model.dto.MultiPaymentAllocation;
 import be.smobile.reconciliation.model.enums.BankTransactionStatus;
 import be.smobile.reconciliation.model.enums.InvoiceStatus;
 import be.smobile.reconciliation.model.enums.InvoiceType;
+import be.smobile.reconciliation.model.enums.TransactionDirection;
 import be.smobile.reconciliation.repository.InvoiceAllocatedTotal;
 import be.smobile.reconciliation.repository.ReconciliationRepository;
 import be.smobile.reconciliation.repository.SupplierDocumentsRecordRepository;
@@ -273,12 +274,17 @@ public class BankTransactionDtoMapper {
 
         List<Long> invoiceIds = group.allocations().stream()
                 .map(MultiPaymentAllocationService.PaymentAllocation::invoiceId).distinct().toList();
+        boolean customerSide = !group.payments().isEmpty() && group.payments().get(0).getDirection() == TransactionDirection.CREDIT;
         Map<Long, String> invoiceNumbers = new java.util.HashMap<>();
-        supplierDocumentsRecordRepository.findAllById(invoiceIds).forEach(r -> invoiceNumbers.put(r.getId(), InvoiceNumbers.of(r)));
+        Map<Long, String> supplierNames = new java.util.HashMap<>();
+        supplierDocumentsRecordRepository.findAllById(invoiceIds).forEach(r -> {
+            invoiceNumbers.put(r.getId(), InvoiceNumbers.of(r));
+            supplierNames.put(r.getId(), blankToNull(candidateResolver.partnerName(r, customerSide)));
+        });
 
         List<MultiPaymentAllocation.AllocationLine> lines = group.allocations().stream()
                 .map(a -> new MultiPaymentAllocation.AllocationLine(
-                        labelByPaymentId.get(a.payment().getId()), a.invoiceId(), invoiceNumbers.get(a.invoiceId()), a.amount()))
+                        labelByPaymentId.get(a.payment().getId()), a.invoiceId(), invoiceNumbers.get(a.invoiceId()), supplierNames.get(a.invoiceId()), a.amount()))
                 .toList();
 
         BigDecimal totalPayments = payments.stream().map(MultiPaymentAllocation.PaymentSummary::amount).reduce(BigDecimal.ZERO, BigDecimal::add);
@@ -341,7 +347,12 @@ public class BankTransactionDtoMapper {
                 record.getId(), InvoiceNumbers.of(record), record.getTotalDue(), record.getCurrency(),
                 type == InvoiceType.CUSTOMER ? "credit" : "debit",
                 invoiceStatusWireValue(record, type, paidAmount),
-                null, record.getDescription(), record.getInvoiceDate());
+                null, record.getDescription(), record.getInvoiceDate(),
+                blankToNull(candidateResolver.partnerName(record, type == InvoiceType.CUSTOMER)));
+    }
+
+    private String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     /**

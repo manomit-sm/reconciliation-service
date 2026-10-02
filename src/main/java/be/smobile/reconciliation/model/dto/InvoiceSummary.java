@@ -29,10 +29,12 @@ public record InvoiceSummary(
         @Schema(description = "Bank of the transaction this invoice was reconciled against. Present only in a reconciled transaction's matched_invoices.", example = "ING Belgium")
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("bank_name") String bankName,
         @Schema(description = "Free-text description of the invoice/expense") String description,
-        @Schema(description = "Date the invoice was issued") @JsonProperty("invoice_date") LocalDate invoiceDate) {
+        @Schema(description = "Date the invoice was issued") @JsonProperty("invoice_date") LocalDate invoiceDate,
+        @Schema(description = "The counterparty on the invoice - the supplier for an expense, the customer for a sales invoice", example = "NCR Voyix Belgium BV")
+        @JsonProperty("supplier_name") String supplierName) {
 
     /** Same invoice, tagged with the bank of the transaction it was reconciled against - client feedback 2026-09-28 (point 3). */
     public InvoiceSummary withBankName(String bankName) {
-        return new InvoiceSummary(id, invoiceNumber, amount, currency, type, status, bankName, description, invoiceDate);
+        return new InvoiceSummary(id, invoiceNumber, amount, currency, type, status, bankName, description, invoiceDate, supplierName);
     }
 }

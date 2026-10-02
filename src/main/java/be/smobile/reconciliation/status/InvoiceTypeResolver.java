@@ -24,7 +24,21 @@ import org.springframework.stereotype.Component;
 @Component
 public class InvoiceTypeResolver {
 
+    /**
+     * {@code crdr} first (client feedback 2026-10-02): the client's UI lists expenses as "Debit"
+     * and sales invoices as "Credit" and every expense payload they sent has {@code "crdr":"debit"},
+     * whereas {@code supplierId} is <i>null</i> on the new expenses they create (record 72, an
+     * EXPENSE) - so the heuristic below alone called those customer invoices. Any other
+     * {@code crdr} value ("debit_note", blank, ...) falls back to the {@code supplierId} guess.
+     */
     public InvoiceType resolve(SupplierDocumentsRecord record) {
+        String crdr = record.getCrdr() == null ? "" : record.getCrdr().trim();
+        if ("debit".equalsIgnoreCase(crdr)) {
+            return InvoiceType.SUPPLIER;
+        }
+        if ("credit".equalsIgnoreCase(crdr)) {
+            return InvoiceType.CUSTOMER;
+        }
         return record.getSupplierId() != null ? InvoiceType.SUPPLIER : InvoiceType.CUSTOMER;
     }
 }

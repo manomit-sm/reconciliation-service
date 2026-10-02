@@ -44,6 +44,23 @@ class ReconciliationDashboardServiceTest {
                 reconciliationRepository, new InvoiceStatusCalculator(), new InvoiceTypeResolver());
     }
 
+    /** Client feedback 2026-10-02, point 1: the dashboard now asks for an explicit startDate/endDate range. */
+    @Test
+    void summary_byDateRange_countsOverThatRangeAndEchoesIt() {
+        LocalDate start = LocalDate.of(2026, 9, 25);
+        LocalDate end = LocalDate.of(2026, 10, 2);
+        when(bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.UNMATCHED)).thenReturn(3L);
+        when(bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.SUGGESTED_MATCH)).thenReturn(2L);
+        when(bankTransactionRepository.countByTransactionDateBetweenAndReconciliationStatus(start, end, BankTransactionStatus.NEEDS_REVIEW)).thenReturn(1L);
+        when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(List.of());
+
+        ReconciliationSummaryResponse response = service().summary(start, end);
+
+        assertEquals(new ReconciliationSummaryResponse(start, end, new ReconciliationSummaryResponse.Summary(3, 2, 1, 0, 0)), response);
+        assertEquals(null, response.year());
+        assertEquals(null, response.month());
+    }
+
     @Test
     void summary_reportsTransactionCountsPerStatus_forTheSelectedMonth() {
         LocalDate start = LocalDate.of(2026, 9, 1);

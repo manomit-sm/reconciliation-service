@@ -215,6 +215,60 @@ class ReconciliationCandidateResolverTest {
         org.mockito.Mockito.verify(supplierDocumentsRecordRepository, org.mockito.Mockito.times(1)).findByDueDateGreaterThanEqualOrDueDateIsNull(any());
     }
 
+    /** Client feedback 2026-10-02: the engine needs the invoice date (not just the due date) and the document's own reference/order number. */
+    @Test
+    void candidateCarriesTheInvoiceDateAndTheDocumentsOwnReferenceAndOrderNumber() {
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder()
+                .id(7L).clientName("January Transaction #27").invoiceNumber("INV00027").reference("JAN-2026-0027").orderNumber(" ")
+                .invoiceDate(LocalDate.of(2026, 1, 27)).dueDate(LocalDate.of(2026, 10, 2)).totalDue(8046.0).build();
+        when(supplierDocumentsRecordRepository.findByDueDateGreaterThanEqualOrDueDateIsNull(any())).thenReturn(List.of(record));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        BankTransaction transaction = BankTransaction.builder()
+                .direction(TransactionDirection.CREDIT).transactionDate(LocalDate.of(2026, 1, 27)).build();
+
+        MatchCandidate candidate = resolver().resolveCandidates(transaction).getFirst();
+
+        assertEquals("INV00027", candidate.invoiceNumber());
+        assertEquals(LocalDate.of(2026, 1, 27), candidate.invoiceDate());
+        assertEquals(List.of("JAN-2026-0027"), candidate.references()); // blank order number dropped
+    }
+
+    /** Falls back to the generic "date" column when invoice_date is empty. */
+    @Test
+    void invoiceDateFallsBackToTheDateColumn() {
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder()
+                .id(8L).businessName("X").date(LocalDate.of(2026, 1, 5)).dueDate(LocalDate.of(2026, 1, 9)).totalDue(10.0).build();
+        when(supplierDocumentsRecordRepository.findByDueDateGreaterThanEqualOrDueDateIsNull(any())).thenReturn(List.of(record));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        BankTransaction transaction = BankTransaction.builder()
+                .direction(TransactionDirection.DEBIT).transactionDate(LocalDate.of(2026, 1, 9)).build();
+
+        assertEquals(LocalDate.of(2026, 1, 5), resolver().resolveCandidates(transaction).getFirst().invoiceDate());
+    }
+
+    /**
+     * Money out can only pay an expense (crdr "debit"), money in a sales invoice ("credit") - the
+     * exact-amount search ignores partner names, so without this a 4,860.50 payment could be
+     * paired with an unrelated opposite-direction document of the same amount.
+     */
+    @Test
+    void documentsOfTheOppositeDirectionAreNotCandidates() {
+        SupplierDocumentsRecord expense = SupplierDocumentsRecord.builder().id(1L).crdr("debit").supplierName("S").dueDate(LocalDate.of(2026, 9, 5)).totalDue(100.0).build();
+        SupplierDocumentsRecord salesInvoice = SupplierDocumentsRecord.builder().id(2L).crdr("credit").clientName("C").dueDate(LocalDate.of(2026, 9, 5)).totalDue(100.0).build();
+        SupplierDocumentsRecord debitNote = SupplierDocumentsRecord.builder().id(3L).crdr("debit_note").dueDate(LocalDate.of(2026, 9, 5)).totalDue(100.0).build();
+        SupplierDocumentsRecord unflagged = SupplierDocumentsRecord.builder().id(4L).dueDate(LocalDate.of(2026, 9, 5)).totalDue(100.0).build();
+        when(supplierDocumentsRecordRepository.findByDueDateGreaterThanEqualOrDueDateIsNull(any())).thenReturn(List.of(expense, salesInvoice, debitNote, unflagged));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        BankTransaction moneyOut = BankTransaction.builder().direction(TransactionDirection.DEBIT).transactionDate(LocalDate.of(2026, 9, 5)).build();
+        BankTransaction moneyIn = BankTransaction.builder().direction(TransactionDirection.CREDIT).transactionDate(LocalDate.of(2026, 9, 5)).build();
+
+        assertEquals(List.of(1L, 3L, 4L), resolver().resolveCandidates(moneyOut).stream().map(MatchCandidate::invoiceId).toList());
+        assertEquals(List.of(2L, 3L, 4L), resolver().resolveCandidates(moneyIn).stream().map(MatchCandidate::invoiceId).toList());
+    }
+
     private InvoiceAllocatedTotal allocatedTotal(Long invoiceId, BigDecimal total) {
         return new InvoiceAllocatedTotal() {
             @Override
