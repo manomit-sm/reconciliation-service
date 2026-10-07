@@ -351,6 +351,7 @@ public class ReconciliationController {
         }
         try {
             reconciliationService.rematchUnmatched(start, end);
+            multiPaymentAllocationService.promoteGroupedPayments(start, end);
         } catch (RuntimeException e) {
             log.warn("Re-matching unmatched transactions for {}..{} failed; serving last known statuses", start, end, e);
         }

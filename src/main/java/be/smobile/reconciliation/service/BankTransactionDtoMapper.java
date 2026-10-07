@@ -37,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -169,8 +170,11 @@ public class BankTransactionDtoMapper {
         return switch (tx.getReconciliationStatus()) {
             case RECONCILED -> withReconciledFields(base, tx);
             case NEEDS_REVIEW -> withReviewFields(base, tx);
-            case SUGGESTED_MATCH -> withMultiPaymentAllocation(withSuggestionFields(base, tx), tx);
-            case UNMATCHED -> withMultiPaymentAllocation(base, tx);
+            case SUGGESTED_MATCH -> {
+                Optional<MultiPaymentAllocationService.PaymentGroup> group = multiPaymentAllocationService.findGroup(tx);
+                yield withMultiPaymentAllocation(withSuggestionFields(base, tx, group), group);
+            }
+            case UNMATCHED -> withMultiPaymentAllocation(base, multiPaymentAllocationService.findGroup(tx));
         };
     }
 
@@ -220,9 +224,12 @@ public class BankTransactionDtoMapper {
     }
 
     /** 4.3: live-recomputed suggestion (not persisted anywhere until confirmed) - same engine call {@code ReconciliationService#suggest} makes, but this also needs the underlying {@link MatchCandidate}s for matched_invoices/matching_criteria text. */
-    private BankTransactionDetail withSuggestionFields(BankTransactionDetail base, BankTransaction tx) {
+    private BankTransactionDetail withSuggestionFields(BankTransactionDetail base, BankTransaction tx, Optional<MultiPaymentAllocationService.PaymentGroup> group) {
         List<MatchCandidate> candidates = candidateResolver.resolveCandidates(tx);
         MatchSuggestion suggestion = matchingEngine.suggest(tx, candidates);
+        if (suggestion.allocations().isEmpty()) {
+            suggestion = groupShareSuggestion(tx, candidates, group).orElse(suggestion);
+        }
         boolean customerInvoice = candidateResolver.treatAsCustomerInvoice(tx);
 
         List<Long> matchedIds = suggestion.allocations().stream().map(a -> a.invoiceId()).toList();
@@ -247,9 +254,40 @@ public class BankTransactionDtoMapper {
                 base.createdAt(), base.updatedAt());
     }
 
+    /**
+     * Client feedback 2026-10-07 (point 1): a payment that is only one part of a bigger invoice
+     * (three bank transactions paying one €28,150.71 invoice) has no suggestion of its own - the
+     * engine looks at one transaction at a time - yet is "Suggested" because the group is. Its
+     * suggestion is then the invoice <i>as if</i> this payment's own share were all that was
+     * left of it, so the engine reports the real amount/partner/reference/date criteria and the
+     * allocation of exactly this payment, instead of an empty suggestion.
+     */
+    private Optional<MatchSuggestion> groupShareSuggestion(BankTransaction tx, List<MatchCandidate> candidates,
+                                                           Optional<MultiPaymentAllocationService.PaymentGroup> group) {
+        if (group.isEmpty()) {
+            return Optional.empty();
+        }
+        Map<Long, MatchCandidate> candidatesById = candidates.stream()
+                .collect(Collectors.toMap(MatchCandidate::invoiceId, c -> c, (a, b) -> a));
+        List<MatchCandidate> shares = group.get().allocations().stream()
+                .filter(a -> a.payment().getId().equals(tx.getId()))
+                .filter(a -> candidatesById.containsKey(a.invoiceId()))
+                .map(a -> {
+                    MatchCandidate invoice = candidatesById.get(a.invoiceId());
+                    return new MatchCandidate(invoice.invoiceId(), invoice.invoiceNumber(), invoice.partnerName(), invoice.dueDate(),
+                            a.amount(), invoice.invoiceDate(), invoice.references());
+                })
+                .toList();
+        if (shares.isEmpty()) {
+            return Optional.empty();
+        }
+        MatchSuggestion suggestion = matchingEngine.suggest(tx, shares);
+        return suggestion.allocations().isEmpty() ? Optional.empty() : Optional.of(suggestion);
+    }
+
     /** See {@link MultiPaymentAllocationService} - rebuilds {@code detail} with {@code multiPaymentAllocation} populated when a group is found, unchanged otherwise. */
-    private BankTransactionDetail withMultiPaymentAllocation(BankTransactionDetail detail, BankTransaction tx) {
-        return multiPaymentAllocationService.findGroup(tx)
+    private BankTransactionDetail withMultiPaymentAllocation(BankTransactionDetail detail, Optional<MultiPaymentAllocationService.PaymentGroup> found) {
+        return found
                 .map(group -> new BankTransactionDetail(
                         detail.id(), detail.accountId(), detail.bankName(), detail.statementId(), detail.sourceType(),
                         detail.externalTransactionId(), detail.transactionDate(), detail.description(), detail.reference(),

@@ -1,5 +1,6 @@
 package be.smobile.reconciliation.service;
 
+import be.smobile.reconciliation.config.SummaryProperties;
 import be.smobile.reconciliation.entity.SupplierDocumentsRecord;
 import be.smobile.reconciliation.model.dto.ReconciliationSummaryResponse;
 import be.smobile.reconciliation.model.enums.BankTransactionStatus;
@@ -41,7 +42,7 @@ class ReconciliationDashboardServiceTest {
 
     private ReconciliationDashboardService service() {
         return new ReconciliationDashboardService(bankTransactionRepository, supplierDocumentsRecordRepository,
-                reconciliationRepository, new InvoiceStatusCalculator(), new InvoiceTypeResolver());
+                reconciliationRepository, new InvoiceStatusCalculator(), new InvoiceTypeResolver(), new SummaryProperties());
     }
 
     /** Client feedback 2026-10-02, point 1: the dashboard now asks for an explicit startDate/endDate range. */
@@ -79,9 +80,9 @@ class ReconciliationDashboardServiceTest {
     @Test
     void overdueCounts_splitByCustomerVsSupplier_viaSupplierIdHeuristic() {
         SupplierDocumentsRecord overdueCustomerInvoice = SupplierDocumentsRecord.builder()
-                .id(1L).totalDue(100.0).dueDate(LocalDate.of(2026, 1, 1)).build(); // no supplierId -> customer
+                .id(1L).totalDue(100.0).invoiceDate(SEPT).dueDate(LocalDate.of(2026, 9, 2)).build(); // no supplierId -> customer
         SupplierDocumentsRecord overdueSupplierInvoice = SupplierDocumentsRecord.builder()
-                .id(2L).totalDue(200.0).dueDate(LocalDate.of(2026, 1, 1)).supplierId(55L).build();
+                .id(2L).totalDue(200.0).invoiceDate(SEPT).dueDate(LocalDate.of(2026, 9, 2)).supplierId(55L).build();
         when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(List.of(overdueCustomerInvoice, overdueSupplierInvoice));
         when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
 
@@ -94,7 +95,7 @@ class ReconciliationDashboardServiceTest {
     @Test
     void overdueCounts_fullyAllocatedInvoice_isNotOverdue() {
         SupplierDocumentsRecord paidOff = SupplierDocumentsRecord.builder()
-                .id(1L).totalDue(100.0).dueDate(LocalDate.of(2026, 1, 1)).build();
+                .id(1L).totalDue(100.0).invoiceDate(SEPT).dueDate(LocalDate.of(2026, 9, 2)).build();
         when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(List.of(paidOff));
         when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList()))
                 .thenReturn(List.of(allocatedTotal(1L, new BigDecimal("100.00"))));
@@ -108,13 +109,103 @@ class ReconciliationDashboardServiceTest {
     @Test
     void overdueCounts_draftInvoice_isExcluded() {
         SupplierDocumentsRecord draft = SupplierDocumentsRecord.builder()
-                .id(1L).totalDue(100.0).dueDate(LocalDate.of(2026, 1, 1)).status((short) 0).build();
+                .id(1L).totalDue(100.0).invoiceDate(SEPT).dueDate(LocalDate.of(2026, 9, 2)).status((short) 0).build();
         when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(List.of(draft));
 
         ReconciliationSummaryResponse response = service().summary(2026, 9);
 
         assertEquals(0, response.summary().overdueCustomers());
         assertEquals(0, response.summary().overdueSuppliers());
+    }
+
+    private static final LocalDate SEPT = LocalDate.of(2026, 9, 10);
+
+    private SupplierDocumentsRecord overdue(long id, String crdr, LocalDate invoiceDate, Integer status) {
+        return SupplierDocumentsRecord.builder().id(id).crdr(crdr).totalDue(100.0).invoiceDate(invoiceDate)
+                .dueDate(invoiceDate.plusDays(1)).status(status == null ? null : status.shortValue()).build();
+    }
+
+    private ReconciliationSummaryResponse.Summary summaryOf(List<SupplierDocumentsRecord> records, LocalDate start, LocalDate end) {
+        when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(records);
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+        return service().summary(start, end).summary();
+    }
+
+    /**
+     * Client feedback 2026-10-07 (points 2/3): the cards showed the same 20 / 16 whatever range
+     * was selected, because every document the account ever had was counted.
+     */
+    @Test
+    void overdueCounts_onlyCountDocumentsDatedInsideTheSelectedRange() {
+        List<SupplierDocumentsRecord> records = List.of(
+                overdue(1, "credit", LocalDate.of(2026, 5, 28), 4),
+                overdue(2, "credit", LocalDate.of(2026, 5, 29), 4),
+                overdue(3, "credit", LocalDate.of(2025, 11, 3), 4),   // outside the range
+                overdue(4, "debit", LocalDate.of(2026, 1, 29), 0),
+                overdue(5, "debit", LocalDate.of(2025, 12, 31), 0));  // outside the range
+
+        ReconciliationSummaryResponse.Summary inRange = summaryOf(records, LocalDate.of(2026, 1, 1), LocalDate.of(2026, 10, 31));
+        assertEquals(2, inRange.overdueCustomers());
+        assertEquals(1, inRange.overdueSuppliers());
+    }
+
+    @Test
+    void overdueCounts_changeWhenTheRangeChanges() {
+        List<SupplierDocumentsRecord> records = List.of(
+                overdue(1, "credit", LocalDate.of(2026, 5, 28), 4),
+                overdue(2, "debit", LocalDate.of(2026, 1, 29), 0));
+
+        assertEquals(1, summaryOf(records, LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)).overdueCustomers());
+        assertEquals(0, summaryOf(records, LocalDate.of(2026, 5, 1), LocalDate.of(2026, 5, 31)).overdueSuppliers());
+        assertEquals(0, summaryOf(records, LocalDate.of(2026, 1, 1), LocalDate.of(2026, 1, 31)).overdueCustomers());
+        assertEquals(1, summaryOf(records, LocalDate.of(2026, 1, 1), LocalDate.of(2026, 1, 31)).overdueSuppliers());
+    }
+
+    /** The client's expense list: paid rows (status 6 / paid_status 1) are not overdue; a new, unpaid expense (status 0) is. */
+    @Test
+    void overdueCounts_aDocumentMarkedPaidIsNotOverdue_butAnUnpaidStatusZeroExpenseIs() {
+        SupplierDocumentsRecord paidByStatus = overdue(1, "debit", SEPT, 6);
+        SupplierDocumentsRecord paidByFlag = SupplierDocumentsRecord.builder().id(2L).crdr("debit").totalDue(100.0)
+                .invoiceDate(SEPT).dueDate(SEPT.plusDays(1)).paidStatus(1).build();
+        SupplierDocumentsRecord unpaidNewExpense = overdue(3, "debit", SEPT, 0);
+
+        ReconciliationSummaryResponse.Summary summary = summaryOf(List.of(paidByStatus, paidByFlag, unpaidNewExpense),
+                LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30));
+
+        assertEquals(1, summary.overdueSuppliers());
+    }
+
+    @Test
+    void overdueCounts_aSalesInvoiceNotYetSentOrInDraftIsNotOverdue_butASentOneIs() {
+        SupplierDocumentsRecord toBeSent = overdue(1, "credit", SEPT, 1);
+        SupplierDocumentsRecord draftStatus = overdue(2, "credit", SEPT, 0);
+        SupplierDocumentsRecord draftFlag = SupplierDocumentsRecord.builder().id(3L).crdr("credit").totalDue(100.0)
+                .invoiceDate(SEPT).dueDate(SEPT.plusDays(1)).status((short) 4).draftInvoice(true).build();
+        SupplierDocumentsRecord sent = overdue(4, "credit", SEPT, 4);
+
+        assertEquals(1, summaryOf(List.of(toBeSent, draftStatus, draftFlag, sent), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30)).overdueCustomers());
+    }
+
+    @Test
+    void overdueCounts_creditAndDebitNotesBelongToNeitherCard() {
+        ReconciliationSummaryResponse.Summary summary = summaryOf(
+                List.of(overdue(1, "debit_note", SEPT, 1), overdue(2, "credit_note", SEPT, 4)), LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30));
+
+        assertEquals(0, summary.overdueCustomers());
+        assertEquals(0, summary.overdueSuppliers());
+    }
+
+    @Test
+    void overdueCounts_theExcludedStatusesAreConfigurable() {
+        SummaryProperties properties = new SummaryProperties();
+        properties.setOverdueExcludedCustomerStatuses(List.of(3));
+        when(supplierDocumentsRecordRepository.findByDueDateLessThan(any())).thenReturn(List.of(overdue(1, "credit", SEPT, 3), overdue(2, "credit", SEPT, 1)));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(anyList())).thenReturn(List.of());
+
+        ReconciliationDashboardService custom = new ReconciliationDashboardService(bankTransactionRepository, supplierDocumentsRecordRepository,
+                reconciliationRepository, new InvoiceStatusCalculator(), new InvoiceTypeResolver(), properties);
+
+        assertEquals(1, custom.summary(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 9, 30)).summary().overdueCustomers());
     }
 
     private InvoiceAllocatedTotal allocatedTotal(Long invoiceId, BigDecimal total) {

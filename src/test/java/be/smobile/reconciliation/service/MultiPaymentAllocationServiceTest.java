@@ -3,6 +3,7 @@ package be.smobile.reconciliation.service;
 import be.smobile.reconciliation.entity.BankTransaction;
 import be.smobile.reconciliation.matching.InvoiceAllocation;
 import be.smobile.reconciliation.matching.MatchCandidate;
+import be.smobile.reconciliation.matching.MatchingProperties;
 import be.smobile.reconciliation.model.enums.BankTransactionStatus;
 import be.smobile.reconciliation.model.enums.TransactionDirection;
 import be.smobile.reconciliation.repository.BankTransactionRepository;
@@ -43,7 +44,7 @@ class MultiPaymentAllocationServiceTest {
     private final UUID accountId = UUID.randomUUID();
 
     private MultiPaymentAllocationService service() {
-        return new MultiPaymentAllocationService(bankTransactionRepository, candidateResolver, reconciliationService);
+        return new MultiPaymentAllocationService(bankTransactionRepository, candidateResolver, reconciliationService, new MatchingProperties());
     }
 
     /** "Wholesale Co sent 2 payments covering 3 open invoices" - 600 -> INV-030 (500) + INV-031 (100); 400 -> INV-031 (100) + INV-032 (300). */
@@ -178,6 +179,132 @@ class MultiPaymentAllocationServiceTest {
         when(bankTransactionRepository.findById(id)).thenReturn(Optional.empty());
 
         assertThrows(EntityNotFoundException.class, () -> service().markGroupForReview(id, "comment"));
+    }
+
+    // ---- Several payments, one invoice (client feedback 2026-10-07, point 1) - the client's own figures ----
+
+    /**
+     * Invoice INV00037 (28,150.71, dated 18 Jan, due 6 Oct) was created as the sum of three bank
+     * transactions of the same day with three different descriptions; they stayed "Unmatched".
+     */
+    private final BankTransaction p80 = payment("January Transaction #80", LocalDate.of(2026, 1, 18), new BigDecimal("862.36"));
+    private final BankTransaction p49 = payment("January Transaction #49", LocalDate.of(2026, 1, 18), new BigDecimal("15078.03"));
+    private final BankTransaction p18 = payment("January Transaction #18", LocalDate.of(2026, 1, 18), new BigDecimal("12210.32"));
+
+    private MatchCandidate inv37() {
+        return new MatchCandidate(37L, "INV00037", "January Transaction #27", LocalDate.of(2026, 10, 6),
+                new BigDecimal("28150.71"), LocalDate.of(2026, 1, 18), List.of());
+    }
+
+    @Test
+    void findGroup_threePaymentsWithDifferentDescriptionsThatPayOneInvoice_areGrouped() {
+        BankTransaction unrelatedSameDay = payment("Something else", LocalDate.of(2026, 1, 18), new BigDecimal("100.00"));
+        BankTransaction unrelatedLater = payment("Much later", LocalDate.of(2026, 3, 1), new BigDecimal("500.00"));
+        when(bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, groupableStatuses()))
+                .thenReturn(List.of(p80, p49, p18, unrelatedSameDay, unrelatedLater));
+        when(candidateResolver.resolveCandidates(p49)).thenReturn(List.of(inv37()));
+
+        Optional<MultiPaymentAllocationService.PaymentGroup> group = service().findGroup(p49);
+
+        assertTrue(group.isPresent());
+        assertEquals(3, group.get().payments().size());
+        assertEquals(List.of(p80.getId(), p49.getId(), p18.getId()).stream().sorted().toList(),
+                group.get().payments().stream().map(BankTransaction::getId).sorted().toList());
+        assertEquals(3, group.get().allocations().size());
+        group.get().allocations().forEach(a -> {
+            assertEquals(37L, a.invoiceId());
+            assertEquals(0, a.payment().getAmount().compareTo(a.amount()));
+        });
+        BigDecimal total = group.get().allocations().stream().map(MultiPaymentAllocationService.PaymentAllocation::amount).reduce(BigDecimal.ZERO, BigDecimal::add);
+        assertEquals(0, total.compareTo(new BigDecimal("28150.71")));
+    }
+
+    @Test
+    void findGroup_paymentsThatAreOffByACent_areNotGrouped() {
+        BankTransaction off = payment("January Transaction #18", LocalDate.of(2026, 1, 18), new BigDecimal("12210.33"));
+        when(bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, groupableStatuses())).thenReturn(List.of(p80, p49, off));
+        when(candidateResolver.resolveCandidates(p49)).thenReturn(List.of(inv37()));
+
+        assertTrue(service().findGroup(p49).isEmpty());
+    }
+
+    @Test
+    void findGroup_paymentsFarFromTheInvoiceDate_areNotGrouped() {
+        BankTransaction early = payment("a", LocalDate.of(2026, 1, 1), new BigDecimal("862.36"));
+        BankTransaction mid = payment("b", LocalDate.of(2026, 1, 1), new BigDecimal("15078.03"));
+        BankTransaction late = payment("c", LocalDate.of(2026, 1, 1), new BigDecimal("12210.32"));
+        when(bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, groupableStatuses())).thenReturn(List.of(early, mid, late));
+        when(candidateResolver.resolveCandidates(mid)).thenReturn(List.of(inv37()));
+
+        assertTrue(service().findGroup(mid).isEmpty());
+    }
+
+    @Test
+    void findGroup_aPaymentInTheOppositeDirectionIsNeverPartOfTheGroup() {
+        BankTransaction moneyOut = BankTransaction.builder().id(UUID.randomUUID()).accountId(accountId).description("out").amount(new BigDecimal("12210.32"))
+                .direction(TransactionDirection.DEBIT).transactionDate(LocalDate.of(2026, 1, 18)).createdAt(Instant.EPOCH).reconciliationStatus(BankTransactionStatus.UNMATCHED).build();
+        when(bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, groupableStatuses())).thenReturn(List.of(p80, p49, moneyOut));
+        when(candidateResolver.resolveCandidates(p49)).thenReturn(List.of(inv37()));
+
+        assertTrue(service().findGroup(p49).isEmpty());
+    }
+
+    @Test
+    void approveGroup_forSeveralPaymentsOneInvoice_reconcilesEachPaymentAgainstItsOwnAmount() {
+        when(bankTransactionRepository.findById(p49.getId())).thenReturn(Optional.of(p49));
+        when(bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, groupableStatuses())).thenReturn(List.of(p80, p49, p18));
+        when(candidateResolver.resolveCandidates(p49)).thenReturn(List.of(inv37()));
+
+        service().approveGroup(p49.getId());
+
+        verify(reconciliationService).confirmMatch(p80.getId(), List.of(new InvoiceAllocation(37L, new BigDecimal("862.36"))));
+        verify(reconciliationService).confirmMatch(p49.getId(), List.of(new InvoiceAllocation(37L, new BigDecimal("15078.03"))));
+        verify(reconciliationService).confirmMatch(p18.getId(), List.of(new InvoiceAllocation(37L, new BigDecimal("12210.32"))));
+    }
+
+    @Test
+    void promoteGroupedPayments_movesTheThreePaymentsToSuggested_andLeavesTheRestUnmatched() {
+        BankTransaction unrelated = payment("Something else", LocalDate.of(2026, 1, 18), new BigDecimal("100.00"));
+        LocalDate start = LocalDate.of(2026, 1, 1);
+        LocalDate end = LocalDate.of(2026, 1, 31);
+        List<BankTransaction> unmatched = List.of(p80, p49, p18, unrelated);
+        unmatched.forEach(tx -> tx.setReconciliationStatus(BankTransactionStatus.UNMATCHED));
+        when(bankTransactionRepository.findByReconciliationStatusAndTransactionDateBetween(BankTransactionStatus.UNMATCHED, start, end)).thenReturn(unmatched);
+        when(candidateResolver.resolveCandidates(unmatched)).thenReturn(java.util.Map.of(
+                p80.getId(), List.of(inv37()), p49.getId(), List.of(inv37()), p18.getId(), List.of(inv37()), unrelated.getId(), List.of(inv37())));
+
+        int promoted = service().promoteGroupedPayments(start, end);
+
+        assertEquals(3, promoted);
+        assertEquals(BankTransactionStatus.SUGGESTED_MATCH, p80.getReconciliationStatus());
+        assertEquals(BankTransactionStatus.SUGGESTED_MATCH, p49.getReconciliationStatus());
+        assertEquals(BankTransactionStatus.SUGGESTED_MATCH, p18.getReconciliationStatus());
+        assertEquals(BankTransactionStatus.UNMATCHED, unrelated.getReconciliationStatus());
+        verify(bankTransactionRepository).save(p80);
+        verify(bankTransactionRepository, org.mockito.Mockito.never()).save(unrelated);
+        verify(reconciliationService, org.mockito.Mockito.never()).confirmMatch(any(), any());
+    }
+
+    @Test
+    void promoteGroupedPayments_nothingToGroup_changesNothing() {
+        LocalDate start = LocalDate.of(2026, 1, 1);
+        LocalDate end = LocalDate.of(2026, 1, 31);
+        when(bankTransactionRepository.findByReconciliationStatusAndTransactionDateBetween(BankTransactionStatus.UNMATCHED, start, end)).thenReturn(List.of(p80));
+
+        assertEquals(0, service().promoteGroupedPayments(start, end));
+    }
+
+    private BankTransaction payment(String description, LocalDate date, BigDecimal amount) {
+        return BankTransaction.builder()
+                .id(UUID.randomUUID())
+                .accountId(accountId)
+                .description(description)
+                .amount(amount)
+                .direction(TransactionDirection.CREDIT)
+                .transactionDate(date)
+                .createdAt(Instant.EPOCH.plusSeconds(paymentSequence++))
+                .reconciliationStatus(BankTransactionStatus.UNMATCHED)
+                .build();
     }
 
     private void assertAllocation(MultiPaymentAllocationService.PaymentAllocation allocation, BankTransaction expectedPayment,

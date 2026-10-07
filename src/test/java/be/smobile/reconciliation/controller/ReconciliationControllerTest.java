@@ -96,6 +96,8 @@ class ReconciliationControllerTest {
         controller().getTransactions(2026, 1, null, null, 1, 20, start, end);
 
         verify(reconciliationService).rematchUnmatched(start, end);
+        // client feedback 2026-10-07 (point 1): several payments paying one invoice are promoted after the per-transaction re-match
+        verify(multiPaymentAllocationService).promoteGroupedPayments(start, end);
     }
 
     @Test

@@ -215,23 +215,9 @@ public class RuleBasedMatchingEngine implements MatchingEngine {
                 .anyMatch(ref -> ref.length() >= MIN_EXTRA_REFERENCE_LENGTH && transactionText.contains(ref));
     }
 
-    /**
-     * Days between the transaction and the closer of the invoice's <i>invoice date</i> and
-     * <i>due date</i> (client feedback 2026-10-02, point 5: comparing the due date alone scored
-     * "Date Match 0" for an expense with exactly the transaction's date, just because it was due
-     * months later). {@link Long#MAX_VALUE} if neither is known.
-     */
+    /** See {@link MatchCandidate#dateDistanceDays} - client feedback 2026-10-02, point 5. */
     private long dateDistanceDays(LocalDate transactionDate, MatchCandidate candidate) {
-        if (transactionDate == null) {
-            return Long.MAX_VALUE;
-        }
-        long best = Long.MAX_VALUE;
-        for (LocalDate date : new LocalDate[]{candidate.invoiceDate(), candidate.dueDate()}) {
-            if (date != null) {
-                best = Math.min(best, Math.abs(ChronoUnit.DAYS.between(transactionDate, date)));
-            }
-        }
-        return best;
+        return candidate.dateDistanceDays(transactionDate);
     }
 
     private String normalize(String value) {
