@@ -36,6 +36,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
@@ -263,6 +264,48 @@ class BankTransactionDtoMapperTest {
         assertEquals("debit", detail.matchedInvoices().getFirst().type());
         assertEquals("NA", detail.matchedInvoices().getFirst().description());
         assertEquals(LocalDate.of(2026, 9, 5), detail.matchedInvoices().getFirst().invoiceDate());
+    }
+
+    /**
+     * Client feedback 2026-10-07 (point 1): a payment that is one part of a group paying a bigger
+     * invoice has no suggestion of its own, yet its detail must show the invoice and this
+     * payment's share of it - not an empty suggestion.
+     */
+    @Test
+    void toDetail_suggestedPaymentThatIsOnePartOfAGroup_showsTheInvoiceAndItsOwnShare() {
+        BankTransaction tx = transaction(BankTransactionStatus.SUGGESTED_MATCH);
+        tx.setAmount(new BigDecimal("862.36"));
+        BankTransaction other = transaction(BankTransactionStatus.SUGGESTED_MATCH);
+        other.setAmount(new BigDecimal("27288.35"));
+        MatchCandidate invoice = new MatchCandidate(37L, "INV00037", "January Transaction #27", LocalDate.of(2026, 10, 6),
+                new BigDecimal("28150.71"), LocalDate.of(2026, 1, 18), List.of());
+        when(candidateResolver.resolveCandidates(tx)).thenReturn(List.of(invoice));
+        when(candidateResolver.treatAsCustomerInvoice(tx)).thenReturn(true);
+        when(matchingEngine.suggest(eq(tx), argThat(list -> list.size() == 1 && list.get(0).remainingBalance().compareTo(new BigDecimal("862.36")) == 0)))
+                .thenReturn(new MatchSuggestion(60, List.of(new be.smobile.reconciliation.matching.InvoiceAllocation(37L, new BigDecimal("862.36"))),
+                        List.of(new MatchCriterion(MatchCriterionType.AMOUNT, true), new MatchCriterion(MatchCriterionType.PARTNER, false),
+                                new MatchCriterion(MatchCriterionType.REFERENCE, false), new MatchCriterion(MatchCriterionType.DATE, true))));
+        // the engine, given the whole 28,150.71 invoice, has nothing for this one payment
+        when(matchingEngine.suggest(eq(tx), argThat(list -> list.size() == 1 && list.get(0).remainingBalance().compareTo(new BigDecimal("28150.71")) == 0)))
+                .thenReturn(MatchSuggestion.none());
+        MultiPaymentAllocationService.PaymentGroup group = new MultiPaymentAllocationService.PaymentGroup(List.of(tx, other), List.of(
+                new MultiPaymentAllocationService.PaymentAllocation(tx, 37L, new BigDecimal("862.36")),
+                new MultiPaymentAllocationService.PaymentAllocation(other, 37L, new BigDecimal("27288.35"))));
+        when(multiPaymentAllocationService.findGroup(tx)).thenReturn(java.util.Optional.of(group));
+        when(reconciliationRepository.sumAllocatedAmountsByInvoiceIds(List.of(37L))).thenReturn(List.of());
+        SupplierDocumentsRecord record = SupplierDocumentsRecord.builder().id(37L).crdr("credit").invoiceNumber("INV00037").clientName("January Transaction #27")
+                .totalDue(28150.71).currency("EUR").invoiceDate(LocalDate.of(2026, 1, 18)).dueDate(LocalDate.of(2026, 10, 6)).build();
+        when(supplierDocumentsRecordRepository.findAllById(List.of(37L))).thenReturn(List.of(record));
+        when(candidateResolver.partnerName(record, true)).thenReturn("January Transaction #27");
+
+        BankTransactionDetail detail = mapper().toDetail(tx);
+
+        assertEquals("suggested_match", detail.reconciliationStatus());
+        assertEquals(1, detail.matchedInvoices().size());
+        assertEquals("INV00037", detail.matchedInvoices().getFirst().invoiceNumber());
+        assertEquals(60, detail.matchScore());
+        assertEquals(0, detail.allocatedAmount().compareTo(new BigDecimal("862.36")));
+        assertEquals(2, detail.multiPaymentAllocation().payments().size());
     }
 
     private BankTransaction transaction(BankTransactionStatus status) {

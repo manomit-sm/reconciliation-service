@@ -3,7 +3,9 @@ package be.smobile.reconciliation.service;
 import be.smobile.reconciliation.entity.BankTransaction;
 import be.smobile.reconciliation.matching.InvoiceAllocation;
 import be.smobile.reconciliation.matching.MatchCandidate;
+import be.smobile.reconciliation.matching.MatchingProperties;
 import be.smobile.reconciliation.model.enums.BankTransactionStatus;
+import be.smobile.reconciliation.model.enums.TransactionDirection;
 import be.smobile.reconciliation.repository.BankTransactionRepository;
 import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
@@ -11,12 +13,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -69,10 +78,16 @@ public class MultiPaymentAllocationService {
     private final BankTransactionRepository bankTransactionRepository;
     private final ReconciliationCandidateResolver candidateResolver;
     private final ReconciliationService reconciliationService;
+    private final MatchingProperties matchingProperties;
 
     /** Read-only lookup - used both to decide whether to show the panel (API 4) and, recomputed fresh, to approve it ({@link #approveGroup}). */
     @Transactional(readOnly = true)
     public Optional<PaymentGroup> findGroup(BankTransaction transaction) {
+        Optional<PaymentGroup> waterfall = findWaterfallGroup(transaction);
+        return waterfall.isPresent() ? waterfall : findPaymentsForOneInvoice(transaction);
+    }
+
+    private Optional<PaymentGroup> findWaterfallGroup(BankTransaction transaction) {
         List<BankTransaction> payments = siblingPayments(transaction);
         if (payments.size() < 2) {
             return Optional.empty();
@@ -82,6 +97,190 @@ public class MultiPaymentAllocationService {
             return Optional.empty();
         }
         return waterfall(payments, invoices);
+    }
+
+    /**
+     * Several payments, one invoice: the fewest payments that include {@code transaction}, are
+     * all in the same direction and within the date tolerance of one open invoice, and add up to
+     * exactly that invoice's balance. Which invoice is tried first: the closest in date to
+     * {@code transaction}.
+     */
+    private Optional<PaymentGroup> findPaymentsForOneInvoice(BankTransaction transaction) {
+        if (transaction.getAmount() == null || transaction.getAmount().signum() <= 0) {
+            return Optional.empty();
+        }
+        List<BankTransaction> pool = sameDirectionPayments(transaction.getAccountId(), transaction.getDirection(), GROUPABLE_STATUSES);
+        if (pool.size() < 2) {
+            return Optional.empty();
+        }
+        List<MatchCandidate> invoices = candidateResolver.resolveCandidates(transaction).stream()
+                .sorted(Comparator.comparingLong((MatchCandidate c) -> c.dateDistanceDays(transaction.getTransactionDate()))
+                        .thenComparing(MatchCandidate::invoiceId))
+                .toList();
+        for (MatchCandidate invoice : invoices) {
+            Optional<List<BankTransaction>> payments = paymentsPayingInvoice(invoice, pool, transaction);
+            if (payments.isPresent()) {
+                return Optional.of(toGroup(payments.get(), invoice));
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Moves still-"Unmatched" payments in {@code [start, end]} to "Suggested" when together they
+     * pay one open invoice exactly (see the class javadoc) - the "several payments, one invoice"
+     * case, which the one-transaction-at-a-time matching in
+     * {@link ReconciliationService#rematchUnmatched} can't see. Each payment is claimed by at most
+     * one invoice. They are suggestions only: nothing is reconciled until the group is approved
+     * ({@link #approveGroup}), even when each payment would score above the auto-reconcile
+     * threshold on its own - a payment that is merely one part of an invoice is exactly the case
+     * where a human should look first.
+     *
+     * @return how many payments were moved
+     */
+    @Transactional
+    public int promoteGroupedPayments(LocalDate start, LocalDate end) {
+        List<BankTransaction> unmatched = bankTransactionRepository
+                .findByReconciliationStatusAndTransactionDateBetween(BankTransactionStatus.UNMATCHED, start, end).stream()
+                .filter(tx -> tx.getAmount() != null && tx.getAmount().signum() > 0)
+                .toList();
+        if (unmatched.size() < 2) {
+            return 0;
+        }
+
+        Map<UUID, List<MatchCandidate>> candidatesByTransaction = candidateResolver.resolveCandidates(unmatched);
+        Map<String, List<BankTransaction>> buckets = unmatched.stream()
+                .collect(Collectors.groupingBy(tx -> tx.getAccountId() + "|" + tx.getDirection(), LinkedHashMap::new, Collectors.toList()));
+
+        int promoted = 0;
+        Set<UUID> claimed = new HashSet<>();
+        for (List<BankTransaction> bucket : buckets.values()) {
+            Map<Long, MatchCandidate> invoices = new TreeMap<>();
+            for (BankTransaction tx : bucket) {
+                candidatesByTransaction.getOrDefault(tx.getId(), List.of()).forEach(c -> invoices.putIfAbsent(c.invoiceId(), c));
+            }
+            for (MatchCandidate invoice : invoices.values()) {
+                List<BankTransaction> free = bucket.stream().filter(tx -> !claimed.contains(tx.getId())).toList();
+                if (free.size() < 2) {
+                    break;
+                }
+                Optional<List<BankTransaction>> payments = paymentsPayingInvoice(invoice, free, null);
+                if (payments.isEmpty()) {
+                    continue;
+                }
+                Instant now = Instant.now();
+                for (BankTransaction payment : payments.get()) {
+                    payment.setReconciliationStatus(BankTransactionStatus.SUGGESTED_MATCH);
+                    payment.setUpdatedAt(now);
+                    bankTransactionRepository.save(payment);
+                    claimed.add(payment.getId());
+                    promoted++;
+                }
+            }
+        }
+        return promoted;
+    }
+
+    /**
+     * The fewest payments from {@code pool} - always including {@code mustInclude} when given -
+     * whose amounts add up to exactly {@code invoice}'s remaining balance, every one dated within
+     * {@code date-tolerance-days} of the invoice's invoice date or due date. At least two payments
+     * (a single payment equal to the invoice is an ordinary one-to-one match, found elsewhere).
+     */
+    private Optional<List<BankTransaction>> paymentsPayingInvoice(MatchCandidate invoice, List<BankTransaction> pool, BankTransaction mustInclude) {
+        BigDecimal balance = invoice.remainingBalance();
+        if (balance == null || balance.signum() <= 0) {
+            return Optional.empty();
+        }
+        long tolerance = matchingProperties.getDateToleranceDays();
+        Comparator<BankTransaction> nearestFirst = Comparator
+                .comparingLong((BankTransaction p) -> invoice.dateDistanceDays(p.getTransactionDate()))
+                .thenComparing(BankTransaction::getTransactionDate)
+                .thenComparing(BankTransaction::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(BankTransaction::getId);
+        List<BankTransaction> eligible = pool.stream()
+                .filter(p -> p.getAmount().compareTo(balance) <= 0)
+                .filter(p -> invoice.dateDistanceDays(p.getTransactionDate()) <= tolerance)
+                .sorted(nearestFirst)
+                .toList();
+
+        List<BankTransaction> others = eligible.stream()
+                .filter(p -> mustInclude == null || !p.getId().equals(mustInclude.getId()))
+                .limit(matchingProperties.getMaxCandidatesForGrouping())
+                .toList();
+        BigDecimal target = balance;
+        if (mustInclude != null) {
+            if (eligible.stream().noneMatch(p -> p.getId().equals(mustInclude.getId()))) {
+                return Optional.empty();
+            }
+            target = balance.subtract(mustInclude.getAmount());
+            if (target.signum() <= 0) {
+                return Optional.empty();
+            }
+        }
+
+        List<Integer> indices = fewestSummingTo(others, target);
+        if (indices == null) {
+            return Optional.empty();
+        }
+        List<BankTransaction> group = new ArrayList<>(indices.stream().map(others::get).toList());
+        if (mustInclude != null) {
+            group.add(mustInclude);
+        }
+        if (group.size() < 2) {
+            return Optional.empty();
+        }
+        group.sort(Comparator.comparing(BankTransaction::getTransactionDate)
+                .thenComparing(BankTransaction::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(BankTransaction::getId));
+        return Optional.of(group);
+    }
+
+    /** Indices of the fewest {@code payments} whose amounts sum to exactly {@code target} (earliest on a tie); null if none. Exact long arithmetic on scale-4 micros, same as the matching engine. */
+    private List<Integer> fewestSummingTo(List<BankTransaction> payments, BigDecimal target) {
+        long goal = toMicros(target);
+        Map<Long, List<Integer>> reachable = new LinkedHashMap<>();
+        reachable.put(0L, List.of());
+        for (int i = 0; i < payments.size(); i++) {
+            long amount = toMicros(payments.get(i).getAmount());
+            if (amount <= 0 || amount > goal) {
+                continue;
+            }
+            Map<Long, List<Integer>> additions = new LinkedHashMap<>();
+            for (Map.Entry<Long, List<Integer>> entry : reachable.entrySet()) {
+                long sum = entry.getKey() + amount;
+                if (sum > goal) {
+                    continue;
+                }
+                List<Integer> current = additions.containsKey(sum) ? additions.get(sum) : reachable.get(sum);
+                if (current != null && current.size() <= entry.getValue().size() + 1) {
+                    continue;
+                }
+                List<Integer> indices = new ArrayList<>(entry.getValue());
+                indices.add(i);
+                additions.put(sum, indices);
+            }
+            reachable.putAll(additions);
+        }
+        List<Integer> hit = reachable.get(goal);
+        return hit == null || hit.isEmpty() ? null : hit;
+    }
+
+    private long toMicros(BigDecimal amount) {
+        return amount.setScale(4, RoundingMode.HALF_UP).unscaledValue().longValueExact();
+    }
+
+    private PaymentGroup toGroup(List<BankTransaction> payments, MatchCandidate invoice) {
+        List<PaymentAllocation> allocations = payments.stream()
+                .map(payment -> new PaymentAllocation(payment, invoice.invoiceId(), payment.getAmount().abs()))
+                .toList();
+        return new PaymentGroup(payments, allocations);
+    }
+
+    private List<BankTransaction> sameDirectionPayments(UUID accountId, TransactionDirection direction, List<BankTransactionStatus> statuses) {
+        return bankTransactionRepository.findByAccountIdAndReconciliationStatusIn(accountId, statuses).stream()
+                .filter(tx -> tx.getDirection() == direction && tx.getAmount() != null && tx.getAmount().signum() > 0)
+                .toList();
     }
 
     /**

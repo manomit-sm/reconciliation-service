@@ -47,6 +47,24 @@ public record MatchCandidate(
         references = references == null ? List.of() : List.copyOf(references);
     }
 
+    /**
+     * Days between {@code date} and the closer of this invoice's invoice date and due date -
+     * what the DATE criterion compares (client feedback 2026-10-02, point 5). {@link Long#MAX_VALUE}
+     * if {@code date} or both of this invoice's dates are unknown.
+     */
+    public long dateDistanceDays(LocalDate date) {
+        if (date == null) {
+            return Long.MAX_VALUE;
+        }
+        long best = Long.MAX_VALUE;
+        for (LocalDate candidateDate : new LocalDate[]{invoiceDate, dueDate}) {
+            if (candidateDate != null) {
+                best = Math.min(best, Math.abs(java.time.temporal.ChronoUnit.DAYS.between(date, candidateDate)));
+            }
+        }
+        return best;
+    }
+
     /** The original five-field form - no invoice date, no extra references. */
     public MatchCandidate(Long invoiceId, String invoiceNumber, String partnerName, LocalDate dueDate, BigDecimal remainingBalance) {
         this(invoiceId, invoiceNumber, partnerName, dueDate, remainingBalance, null, List.of());
